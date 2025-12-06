@@ -123,7 +123,7 @@ class FanMTLCrawler(Crawler):
             options = uc.ChromeOptions()
             options.add_argument("--no-sandbox") 
             options.add_argument("--disable-dev-shm-usage")
-            options.add_argument(f'--proxy-server={self.chrome_proxy}')
+            #options.add_argument(f'--proxy-server={self.chrome_proxy}')
             options.add_argument("--disable-popup-blocking")
             # [FIX] Force specific UA in browser to match curl_cffi
             options.add_argument(f"--user-agent={self.user_agent}")
