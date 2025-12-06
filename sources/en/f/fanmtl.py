@@ -3,6 +3,7 @@ import logging
 import time
 import shutil
 import random
+import json
 from urllib.parse import urlparse, parse_qs 
 from bs4 import BeautifulSoup
 from lncrawl.models import Chapter
@@ -11,8 +12,9 @@ from lncrawl.core.crawler import Crawler
 # [CRITICAL] Bypass Tools
 import undetected_chromedriver as uc
 from pyvirtualdisplay import Display
-from curl_cffi import requests as cffi_requests # Use TLS-mimicking requests
+from curl_cffi import requests as cffi_requests
 from selenium.webdriver.common.by import By
+from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 
@@ -26,8 +28,7 @@ class FanMTLCrawler(Crawler):
         # [TURBO] 50 threads
         self.init_executor(50) 
         
-        # 1. Setup the RUNNER (Using curl_cffi to mimic Chrome TLS)
-        # This fixes the issue where requests get blocked even with valid cookies
+        # 1. Setup the RUNNER (TLS Impersonation)
         self.runner = cffi_requests.Session(impersonate="chrome120")
         
         self.user_agent = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
@@ -39,24 +40,28 @@ class FanMTLCrawler(Crawler):
             "Referer": "https://www.fanmtl.com/",
         })
         
-        # WARP Proxy
-        self.proxy_url = "socks5h://127.0.0.1:40000"
+        # WARP Proxy Configuration
+        # Chrome needs 'socks5://', Requests needs 'socks5h://' (for DNS)
+        self.proxy_ip = "127.0.0.1"
+        self.proxy_port = "40000"
+        self.chrome_proxy = f"socks5://{self.proxy_ip}:{self.proxy_port}"
+        self.requests_proxy = f"socks5h://{self.proxy_ip}:{self.proxy_port}"
+
         self.runner.proxies = {
-            "http": self.proxy_url,
-            "https": self.proxy_url
+            "http": self.requests_proxy,
+            "https": self.requests_proxy
         }
 
         self.scraper = self.runner
         self.cookies_synced = False
         self.cleaner.bad_css.update({'div[align="center"]'})
-        logger.info("FanMTL Strategy: Virtual Display (Headed) -> TLS Impersonation")
+        logger.info("FanMTL Strategy: Virtual Display -> Mouse Jitter -> TLS Impersonation")
 
     def sync_cookies_from_driver(self, driver):
-        """Extracts valid Cloudflare cookies from Chrome."""
+        """Extracts cookies."""
         cookies = driver.get_cookies()
         found_cf = False
         for cookie in cookies:
-            # Set cookies for curl_cffi
             self.runner.cookies.set(
                 cookie['name'], 
                 cookie['value'], 
@@ -72,6 +77,19 @@ class FanMTLCrawler(Crawler):
             return True
         return False
 
+    def simulate_human(self, driver):
+        """Moves mouse randomly to trick Cloudflare active defense."""
+        try:
+            action = ActionChains(driver)
+            # Random movements
+            for _ in range(3):
+                x = random.randint(0, 500)
+                y = random.randint(0, 500)
+                action.move_by_offset(x, y).perform()
+                action.reset_actions()
+                time.sleep(random.uniform(0.1, 0.5))
+        except: pass
+
     def get_soup_browser(self, url):
         """Uses Undetected-Chromedriver inside a Virtual Display."""
         logger.info(f"🌍 Browser fetching: {url}")
@@ -79,8 +97,7 @@ class FanMTLCrawler(Crawler):
         display = None
         
         try:
-            # 1. Start Virtual Display (This is the KEY to bypassing 'headless' checks)
-            # Cloudflare thinks we have a real monitor attached.
+            # 1. Start Virtual Display
             display = Display(visible=0, size=(1920, 1080))
             display.start()
 
@@ -91,40 +108,67 @@ class FanMTLCrawler(Crawler):
             options = uc.ChromeOptions()
             options.add_argument("--no-sandbox") 
             options.add_argument("--disable-dev-shm-usage")
-            options.add_argument(f'--proxy-server={self.proxy_url}')
+            # [FIX] Correct Proxy Format for Chrome
+            options.add_argument(f'--proxy-server={self.chrome_proxy}')
             
-            # Start UC in HEADED mode (headless=False)
             driver = uc.Chrome(
                 options=options,
                 driver_executable_path=driver_path,
                 browser_executable_path=browser_path,
                 use_subprocess=True,
-                headless=False, # [CRITICAL] Must be False to pass active checks
+                headless=False,
                 version_main=120
             )
             
-            driver.set_page_load_timeout(90)
+            driver.set_page_load_timeout(120)
+
+            # [DEBUG] Check IP
+            try:
+                logger.info("🔍 Checking Browser IP...")
+                driver.get("https://api.ipify.org?format=json")
+                body = driver.find_element(By.TAG_NAME, "body").text
+                logger.info(f"🌐 Browser IP is: {body}")
+            except:
+                logger.warning("Could not verify IP.")
+
+            # Load Novel
             driver.get(url)
             
-            # 3. Wait for Cloudflare
             logger.info("⏳ Waiting for Cloudflare clearance...")
             start_time = time.time()
             
-            while time.time() - start_time < 60:
-                # Check if we passed the challenge
+            while time.time() - start_time < 90: # Increased timeout
+                # 1. Simulate Human
+                self.simulate_human(driver)
+
+                # 2. Check Success
                 if "Just a moment" not in driver.title and "challenge" not in driver.page_source.lower():
                     if self.sync_cookies_from_driver(driver):
                         logger.info("🔓 Bypass Successful!")
                         break
                 
-                # Active Defense: Move mouse / Click body to prove humanity
+                # 3. Handle Click (Shadow DOM)
                 try:
-                    body = driver.find_element(By.TAG_NAME, "body")
-                    body.click()
+                    # Look for checkbox in iframes
+                    iframes = driver.find_elements(By.TAG_NAME, "iframe")
+                    for frame in iframes:
+                        try:
+                            if "challenge" in frame.get_attribute("src"):
+                                driver.switch_to.frame(frame)
+                                driver.find_element(By.CSS_SELECTOR, "body").click()
+                                driver.switch_to.default_content()
+                        except: 
+                            driver.switch_to.default_content()
                 except: pass
                 
                 time.sleep(2)
             
+            # Final check before return
+            if not self.cookies_synced:
+                logger.error("❌ Cloudflare loop failed to resolve.")
+                # Log page source snippet for debugging
+                logger.error(driver.page_source[:500])
+
             return self.make_soup(driver.page_source)
             
         except Exception as e:
@@ -139,12 +183,9 @@ class FanMTLCrawler(Crawler):
                 except: pass
 
     def get_soup_safe(self, url, headers=None):
-        """Uses curl_cffi with Chrome Impersonation."""
         retries = 0
         while retries < 3:
             try:
-                # cffi_requests doesn't use the same headers structure as requests
-                # but we initialized the session with them.
                 response = self.runner.get(url, timeout=15)
                 
                 if "just a moment" in response.text.lower():
@@ -152,7 +193,6 @@ class FanMTLCrawler(Crawler):
                         logger.warning("⛔ Request Blocked. Launching solver...")
                         self.get_soup_browser(url) 
                         continue
-                    
                     time.sleep(2)
                     retries += 1
                     continue
@@ -199,7 +239,6 @@ class FanMTLCrawler(Crawler):
                 page_count = int(page_params[0])
                 wjm = query.get("wjm", [""])[0]
                 
-                # Fetch pages with curl_cffi
                 for page in range(0, page_count + 1):
                     url = f"{common_url}?page={page}&wjm={wjm}"
                     page_soup = self.get_soup_safe(url)
@@ -212,7 +251,7 @@ class FanMTLCrawler(Crawler):
         self.chapters.sort(key=lambda x: x["id"])
 
         if not self.chapters:
-            logger.error("❌ NO CHAPTERS FOUND. Cloudflare loop active.")
+            logger.error("❌ NO CHAPTERS FOUND.")
 
     def parse_chapter_list(self, soup):
         if not soup: return
