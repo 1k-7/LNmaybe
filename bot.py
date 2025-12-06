@@ -40,8 +40,8 @@ logging.getLogger("lncrawl").setLevel(logging.WARNING)
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 
 # [SPEED OPTIMIZATION]
-THREADS_PER_NOVEL = 60
-MAX_CONCURRENT_NOVELS = 10
+THREADS_PER_NOVEL = 50     # High threads as requested
+MAX_CONCURRENT_NOVELS = 10 # Keep high concurrency
 
 # Group Configs (Must be -100xxxx format)
 TARGET_GROUP_ID = os.getenv("TARGET_GROUP_ID") 
@@ -90,16 +90,13 @@ def scrape_logic_worker(url, progress_queue):
             # 1. Initialize High-Thread Executor
             app.crawler.init_executor(THREADS_PER_NOVEL)
 
-            # 2. Inject Aggressive Connection Pool
-            if hasattr(app.crawler, 'scraper') and hasattr(app.crawler.scraper, 'mount'):
-                adapter = HTTPAdapter(
-                    pool_connections=THREADS_PER_NOVEL, 
-                    pool_maxsize=THREADS_PER_NOVEL,
-                    max_retries=3,
-                    pool_block=False
-                )
-                app.crawler.scraper.mount("https://", adapter)
-                app.crawler.scraper.mount("http://", adapter)
+            # 2. [CRITICAL FIX] Update Existing Adapters instead of replacing them
+            # This preserves the Cloudflare TLS Fingerprint while allowing high concurrency
+            if hasattr(app.crawler, 'scraper') and hasattr(app.crawler.scraper, 'adapters'):
+                for adapter in app.crawler.scraper.adapters.values():
+                    adapter.pool_connections = THREADS_PER_NOVEL
+                    adapter.pool_maxsize = THREADS_PER_NOVEL
+                    adapter.pool_block = False
 
         # [FIXED] Cover Image - Removed hardcoded headers that caused 403
         if app.crawler.novel_cover:

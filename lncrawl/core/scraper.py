@@ -51,13 +51,13 @@ class Scraper(TaskManager, SoupMaker):
     def init_scraper(self, session: Optional[Session] = None):
         try:
             self.scraper = create_scraper(
-                # [TURBO FIX] Allow 403 retries (required) but make them fast
+                # [TURBO FIX] Aggressive 403 handling
                 auto_refresh_on_403=True, 
-                max_403_retries=3,             
+                max_403_retries=10, # Increased retries to brute force
 
                 # [TURBO FIX] Zero delay, High Concurrency
                 min_request_interval=0,        
-                max_concurrent_requests=100,     
+                max_concurrent_requests=50, # Match thread count   
                 rotate_tls_ciphers=True,       
                 session_refresh_interval=900,  
 
@@ -79,8 +79,7 @@ class Scraper(TaskManager, SoupMaker):
             )
             
             # [CRITICAL SPEED HACK]
-            # Cloudscraper creates custom adapters (CipherSuiteAdapter). 
-            # We must manually boost their pool size to allow parallel downloads.
+            # Boost cloudscraper internal pool size
             if hasattr(self.scraper, 'adapters'):
                 for adapter in self.scraper.adapters.values():
                     adapter.pool_connections = 100
