@@ -3,7 +3,6 @@ import logging
 import time
 import shutil
 import random
-import json
 from urllib.parse import urlparse, parse_qs 
 from bs4 import BeautifulSoup
 from lncrawl.models import Chapter
@@ -29,7 +28,8 @@ class FanMTLCrawler(Crawler):
         self.init_executor(50) 
         
         # 1. Setup the RUNNER (TLS Impersonation)
-        self.runner = cffi_requests.Session(impersonate="chrome120")
+        # Use chrome110 which is sometimes more stable for 520 errors
+        self.runner = cffi_requests.Session(impersonate="chrome110")
         
         self.user_agent = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         
@@ -41,7 +41,6 @@ class FanMTLCrawler(Crawler):
         })
         
         # WARP Proxy Configuration
-        # Chrome needs 'socks5://', Requests needs 'socks5h://' (for DNS)
         self.proxy_ip = "127.0.0.1"
         self.proxy_port = "40000"
         self.chrome_proxy = f"socks5://{self.proxy_ip}:{self.proxy_port}"
@@ -55,10 +54,10 @@ class FanMTLCrawler(Crawler):
         self.scraper = self.runner
         self.cookies_synced = False
         self.cleaner.bad_css.update({'div[align="center"]'})
-        logger.info("FanMTL Strategy: Virtual Display -> Mouse Jitter -> TLS Impersonation")
+        logger.info("FanMTL Strategy: Virtual Display -> Anti-520 Refresh -> TLS")
 
     def sync_cookies_from_driver(self, driver):
-        """Extracts cookies."""
+        """Extracts valid Cloudflare cookies from Chrome."""
         cookies = driver.get_cookies()
         found_cf = False
         for cookie in cookies:
@@ -78,20 +77,19 @@ class FanMTLCrawler(Crawler):
         return False
 
     def simulate_human(self, driver):
-        """Moves mouse randomly to trick Cloudflare active defense."""
+        """Moves mouse to trigger passive checks."""
         try:
             action = ActionChains(driver)
-            # Random movements
-            for _ in range(3):
-                x = random.randint(0, 500)
-                y = random.randint(0, 500)
+            for _ in range(2):
+                x = random.randint(0, 300)
+                y = random.randint(0, 300)
                 action.move_by_offset(x, y).perform()
                 action.reset_actions()
-                time.sleep(random.uniform(0.1, 0.5))
+                time.sleep(0.2)
         except: pass
 
     def get_soup_browser(self, url):
-        """Uses Undetected-Chromedriver inside a Virtual Display."""
+        """Uses Undetected-Chromedriver with 520 Error Recovery."""
         logger.info(f"🌍 Browser fetching: {url}")
         driver = None
         display = None
@@ -108,8 +106,8 @@ class FanMTLCrawler(Crawler):
             options = uc.ChromeOptions()
             options.add_argument("--no-sandbox") 
             options.add_argument("--disable-dev-shm-usage")
-            # [FIX] Correct Proxy Format for Chrome
             options.add_argument(f'--proxy-server={self.chrome_proxy}')
+            options.add_argument("--disable-popup-blocking")
             
             driver = uc.Chrome(
                 options=options,
@@ -121,54 +119,51 @@ class FanMTLCrawler(Crawler):
             )
             
             driver.set_page_load_timeout(120)
-
-            # [DEBUG] Check IP
-            try:
-                logger.info("🔍 Checking Browser IP...")
-                driver.get("https://api.ipify.org?format=json")
-                body = driver.find_element(By.TAG_NAME, "body").text
-                logger.info(f"🌐 Browser IP is: {body}")
-            except:
-                logger.warning("Could not verify IP.")
-
-            # Load Novel
             driver.get(url)
             
-            logger.info("⏳ Waiting for Cloudflare clearance...")
+            logger.info("⏳ Waiting for page load (Checking for 520/Challenge)...")
             start_time = time.time()
             
-            while time.time() - start_time < 90: # Increased timeout
-                # 1. Simulate Human
-                self.simulate_human(driver)
+            while time.time() - start_time < 120: # 2 minutes max
+                # [FIX] Handle 520 Error (Server Reset)
+                # 520 errors are often fixed by clearing cookies and refreshing
+                if "520" in driver.title or "Error" in driver.title:
+                    logger.warning("⚠️ 520 Origin Error Detected. Clearing cookies & Refreshing...")
+                    driver.delete_all_cookies()
+                    time.sleep(1)
+                    driver.refresh()
+                    time.sleep(5)
+                    continue
 
-                # 2. Check Success
-                if "Just a moment" not in driver.title and "challenge" not in driver.page_source.lower():
+                # Handle "Just a moment"
+                if "Just a moment" in driver.title or "challenge" in driver.page_source.lower():
+                    # Move mouse to pass passive check
+                    self.simulate_human(driver)
+                    
+                    # Try to click iframes
+                    try:
+                        iframes = driver.find_elements(By.TAG_NAME, "iframe")
+                        for frame in iframes:
+                            try:
+                                if "challenge" in frame.get_attribute("src"):
+                                    driver.switch_to.frame(frame)
+                                    driver.find_element(By.CSS_SELECTOR, "body").click()
+                                    driver.switch_to.default_content()
+                            except: 
+                                driver.switch_to.default_content()
+                    except: pass
+                    
+                    time.sleep(2)
+                    continue
+
+                # Success Condition: Real Title
+                if "fanmtl" in driver.title.lower() or "novel" in driver.title.lower() or "chapter" in driver.page_source.lower():
                     if self.sync_cookies_from_driver(driver):
                         logger.info("🔓 Bypass Successful!")
                         break
                 
-                # 3. Handle Click (Shadow DOM)
-                try:
-                    # Look for checkbox in iframes
-                    iframes = driver.find_elements(By.TAG_NAME, "iframe")
-                    for frame in iframes:
-                        try:
-                            if "challenge" in frame.get_attribute("src"):
-                                driver.switch_to.frame(frame)
-                                driver.find_element(By.CSS_SELECTOR, "body").click()
-                                driver.switch_to.default_content()
-                        except: 
-                            driver.switch_to.default_content()
-                except: pass
-                
-                time.sleep(2)
+                time.sleep(1)
             
-            # Final check before return
-            if not self.cookies_synced:
-                logger.error("❌ Cloudflare loop failed to resolve.")
-                # Log page source snippet for debugging
-                logger.error(driver.page_source[:500])
-
             return self.make_soup(driver.page_source)
             
         except Exception as e:
@@ -188,11 +183,14 @@ class FanMTLCrawler(Crawler):
             try:
                 response = self.runner.get(url, timeout=15)
                 
-                if "just a moment" in response.text.lower():
+                # If blocked, it means cookies expired or IP rotated bad
+                if "just a moment" in response.text.lower() or response.status_code == 520:
                     if not self.cookies_synced:
                         logger.warning("⛔ Request Blocked. Launching solver...")
                         self.get_soup_browser(url) 
                         continue
+                    
+                    logger.warning(f"⛔ Blocked ({response.status_code}). Retrying...")
                     time.sleep(2)
                     retries += 1
                     continue
