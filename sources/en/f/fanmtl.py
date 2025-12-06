@@ -3,7 +3,7 @@ import logging
 import time
 import requests
 import shutil
-import os
+import random
 from urllib.parse import urlparse, parse_qs 
 from bs4 import BeautifulSoup
 from lncrawl.models import Chapter
@@ -22,14 +22,14 @@ class FanMTLCrawler(Crawler):
     base_url = "https://www.fanmtl.com/"
 
     def initialize(self):
-        # [TURBO] 50 threads as requested
+        # [TURBO] 50 threads for downloading
         self.init_executor(50) 
         
         # 1. Setup the RUNNER
         self.runner = requests.Session()
         
-        # Use a standard, modern Chrome UA (Matched to UC driver below)
-        self.user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        # Sync this UA with the browser later
+        self.user_agent = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         
         self.runner.headers.update({
             "User-Agent": self.user_agent,
@@ -39,15 +39,15 @@ class FanMTLCrawler(Crawler):
             "Upgrade-Insecure-Requests": "1",
         })
         
-        # WARP Proxy (Essential for your setup)
+        # WARP Proxy
         self.proxy_url = "socks5h://127.0.0.1:40000"
         self.runner.proxies = {
             "http": self.proxy_url,
             "https": self.proxy_url
         }
 
-        # Optimized Connection Pool
-        adapter = requests.adapters.HTTPAdapter(pool_connections=50, pool_maxsize=50)
+        # Connection Pool
+        adapter = requests.adapters.HTTPAdapter(pool_connections=100, pool_maxsize=100)
         self.runner.mount("https://", adapter)
         self.runner.mount("http://", adapter)
 
@@ -57,7 +57,7 @@ class FanMTLCrawler(Crawler):
         logger.info("FanMTL Strategy: Undetected Browser -> Requests Body")
 
     def sync_cookies_from_driver(self, driver):
-        """Transplants the 'clearance' cookie from Chrome to Requests."""
+        """Extracts valid Cloudflare cookies from Chrome."""
         cookies = driver.get_cookies()
         found_cf = False
         for cookie in cookies:
@@ -67,71 +67,71 @@ class FanMTLCrawler(Crawler):
                 domain=cookie.get('domain', ''),
                 path=cookie.get('path', '/')
             )
-            if 'cf_clearance' in cookie['name'] or 'cf_chl' in cookie['name']:
+            if 'cf_clearance' in cookie['name']:
                 found_cf = True
         
-        # [CRITICAL] Sync UA exactly. 
-        # Using a different UA than the one that solved the captcha causes infinite loops.
+        # [CRITICAL] Sync UA exactly to the one used by UC
         ua = driver.execute_script("return navigator.userAgent")
         self.runner.headers['User-Agent'] = ua
         
         if found_cf:
             logger.info("✅ Cookies Synced: Cloudflare Clearance Obtained")
             self.cookies_synced = True
-        else:
-            logger.warning("⚠️ Browser finished but 'cf_clearance' missing. IP might be flagged.")
+            return True
+        return False
 
     def get_soup_browser(self, url):
-        """Launches Undetected-Chromedriver to smash through the Cloudflare Loop."""
+        """Uses Undetected-Chromedriver with Retry Logic."""
         logger.info(f"🌍 Browser fetching: {url}")
         driver = None
         try:
+            # Docker Path Handling - Explicitly point to system chromium
+            # This prevents UC from downloading a mismatched binary
+            browser_path = shutil.which("chromium") or "/usr/bin/chromium"
+            driver_path = shutil.which("chromedriver") or "/usr/bin/chromedriver"
+
             options = uc.ChromeOptions()
             options.add_argument("--no-sandbox") 
             options.add_argument("--disable-dev-shm-usage")
-            options.add_argument("--headless=new") # Modern headless
+            options.add_argument("--window-size=1920,1080")
             options.add_argument(f'--proxy-server={self.proxy_url}')
             
-            # Docker Path Handling
-            driver_path = shutil.which("chromedriver") or "/usr/bin/chromedriver"
-            browser_path = shutil.which("chromium") or "/usr/bin/chromium"
-
+            # Start UC (Undetected Chromedriver)
+            # headless=True in UC is special (it doesn't set the flag the same way)
             driver = uc.Chrome(
                 options=options,
                 driver_executable_path=driver_path,
                 browser_executable_path=browser_path,
                 use_subprocess=True,
-                version_main=120 # Adjust if your docker chromium version differs
+                headless=True,
+                version_main=120 # Try to match if possible, or remove if causing errors
             )
             
-            driver.set_page_load_timeout(60)
+            driver.set_page_load_timeout(90)
             driver.get(url)
             
-            # [LOOP FIX] Wait logic for "Just a moment"
-            logger.info("⏳ Waiting for Cloudflare...")
-            time.sleep(5) # Base wait
+            # [CRITICAL] WAIT FOR COOKIE LOOP
+            # We do NOT proceed until we see 'cf_clearance'
+            logger.info("⏳ Waiting for Cloudflare clearance...")
+            start_time = time.time()
+            while time.time() - start_time < 60: # Wait up to 60 seconds
+                if "Just a moment" not in driver.title and "challenge" not in driver.page_source.lower():
+                    # Check if we have the cookie
+                    if self.sync_cookies_from_driver(driver):
+                        logger.info("🔓 Bypass Successful!")
+                        break
+                
+                # If stuck, try scrolling or clicking body to trigger JS
+                try:
+                    driver.find_element(By.TAG_NAME, "body").click()
+                except: pass
+                
+                time.sleep(2)
             
-            try:
-                # 1. Check if we are stuck on the challenge page
-                if "Just a moment" in driver.title or "challenge" in driver.page_source.lower():
-                    logger.info("🔒 Challenge Detected. Attempting to click...")
-                    
-                    # Try clicking the shadow-root checkbox if visible
-                    # Note: UC mode often solves this automatically just by being present
-                    time.sleep(5) 
-                    
-                    # Wait for redirect to actual content
-                    WebDriverWait(driver, 30).until_not(
-                        EC.title_contains("Just a moment")
-                    )
-            except Exception as e:
-                logger.warning(f"Challenge wait timed out (might be passed already): {e}")
-
-            # 2. Verify we are on the novel page
-            if "novel" not in driver.current_url and "fanmtl" not in driver.current_url:
-                 logger.error(f"❌ Browser stuck on: {driver.current_url}")
-
+            # Final Sync
             self.sync_cookies_from_driver(driver)
+            
+            # Return the source
             return self.make_soup(driver.page_source)
             
         except Exception as e:
@@ -143,7 +143,7 @@ class FanMTLCrawler(Crawler):
                 except: pass
 
     def get_soup_safe(self, url, headers=None):
-        """Fast Request with Fallback."""
+        """Standard request with retry logic."""
         retries = 0
         while retries < 3:
             try:
@@ -152,16 +152,13 @@ class FanMTLCrawler(Crawler):
 
                 response = self.runner.get(url, headers=req_headers, timeout=15)
                 
-                # [LOOP FIX] If we see the challenge page text, we are blocked
-                if "just a moment" in response.text.lower() or "enable javascript" in response.text.lower():
+                # Check for Cloudflare Block
+                if "just a moment" in response.text.lower():
                     if not self.cookies_synced:
                         logger.warning("⛔ Request Blocked. Launching solver...")
                         self.get_soup_browser(url) 
                         continue
                     
-                    # If we are synced but still blocked, our IP/Cookie is burned.
-                    # Wait and retry.
-                    logger.warning(f"⛔ Blocked with cookies. Cooling down (2s)...")
                     time.sleep(2)
                     retries += 1
                     continue
@@ -177,14 +174,14 @@ class FanMTLCrawler(Crawler):
     def read_novel_info(self):
         logger.debug("Visiting %s", self.novel_url)
         
-        # 1. Initial Browser Pass (Get Cookies & Info)
+        # 1. Use BROWSER for index
         soup = self.get_soup_browser(self.novel_url)
 
         possible_title = soup.select_one("h1.novel-title")
         if possible_title:
             self.novel_title = possible_title.text.strip()
         else:
-            self.novel_title = "Unknown Title (Possible Block)"
+            self.novel_title = "Unknown Title"
 
         img_tag = soup.select_one("figure.cover img") or soup.select_one(".fixed-img img")
         if img_tag:
@@ -197,10 +194,10 @@ class FanMTLCrawler(Crawler):
         self.volumes = [{"id": 1, "title": "Volume 1"}]
         self.chapters = []
 
-        # 2. Parse Chapters (Browser Source)
+        # 3. Parse Chapters
         self.parse_chapter_list(soup)
 
-        # 3. Handle Pagination (Using Fast Requests)
+        # 4. Handle Pagination
         pagination_links = soup.select('.pagination a[data-ajax-update="#chpagedlist"]')
         if pagination_links:
             try:
@@ -222,17 +219,16 @@ class FanMTLCrawler(Crawler):
             except Exception as e:
                 logger.error(f"Pagination failed: {e}")
 
-        # Sort and deduplicate
         self.chapters = list({c['url']: c for c in self.chapters}.values())
         self.chapters.sort(key=lambda x: x["id"])
 
         if not self.chapters:
-            logger.error("❌ NO CHAPTERS FOUND. Cloudflare loop active.")
+            logger.error("❌ NO CHAPTERS FOUND. Dumping Page Source Snippet:")
+            logger.error(str(soup)[:500])
 
     def parse_chapter_list(self, soup):
         if not soup: return
         
-        # Aggressive selector to catch any chapter link
         links = soup.select(".chapter-list a, ul.chapter-list li a")
         if not links:
             links = soup.select("a[href*='/chapter-']")
