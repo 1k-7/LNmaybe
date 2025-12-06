@@ -350,7 +350,7 @@ class NovelBot:
             await self.send_log(bot, f"⚠️ Backup Failed: {e}")
 
     def start(self):
-        print("🚀 Bot Starting...")
+        print("🚀 Bot Starting ✨...")
         sys.stdout.flush()
         if not TOKEN:
             print("❌ FATAL ERROR: TELEGRAM_TOKEN missing!")

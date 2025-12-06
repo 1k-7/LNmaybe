@@ -21,19 +21,28 @@ class FanMTLCrawler(Crawler):
     base_url = "https://www.fanmtl.com/"
 
     def initialize(self):
-        # [TURBO] 50 threads for downloading (Safe limit for this site)
-        self.init_executor(50) 
+        # [TURBO] 60 threads for downloading
+        self.init_executor(60) 
         
         # 1. Setup the RUNNER (Standard Requests)
         self.runner = requests.Session()
         
-        # Standard Headers
+        # [CRITICAL] Mimic Chrome 120 EXACTLY to match the Browser Solver
+        self.user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        
         self.runner.headers.update({
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "User-Agent": self.user_agent,
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
             "Accept-Language": "en-US,en;q=0.9",
             "Referer": "https://www.fanmtl.com/",
             "Upgrade-Insecure-Requests": "1",
+            "Sec-Ch-Ua": '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
+            "Sec-Ch-Ua-Mobile": "?0",
+            "Sec-Ch-Ua-Platform": '"Windows"',
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": "same-origin",
+            "Sec-Fetch-User": "?1",
         })
         
         # WARP Proxy Configuration
@@ -44,19 +53,18 @@ class FanMTLCrawler(Crawler):
         }
 
         # Optimize connection pool for speed
-        adapter = requests.adapters.HTTPAdapter(pool_connections=50, pool_maxsize=50)
+        adapter = requests.adapters.HTTPAdapter(pool_connections=100, pool_maxsize=100)
         self.runner.mount("https://", adapter)
         self.runner.mount("http://", adapter)
 
         self.scraper = self.runner
         self.cookies_synced = False
         self.cleaner.bad_css.update({'div[align="center"]'})
-        logger.info("FanMTL Strategy: Hybrid (Browser Index -> Requests Body)")
+        logger.info("FanMTL Strategy: Browser TOC -> Requests Body")
 
     def sync_cookies_from_driver(self, driver):
         """Extracts valid Cloudflare cookies from Chrome and gives them to Requests."""
         cookies = driver.get_cookies()
-        ua = driver.execute_script("return navigator.userAgent")
         
         found_cf = False
         for cookie in cookies:
@@ -69,14 +77,11 @@ class FanMTLCrawler(Crawler):
             if 'cf_clearance' in cookie['name']:
                 found_cf = True
         
-        if ua:
-            self.runner.headers['User-Agent'] = ua
-            
         if found_cf:
             logger.info("✅ Cookies Synced: Cloudflare Clearance Obtained")
             self.cookies_synced = True
         else:
-            logger.warning("⚠️ Browser finished but 'cf_clearance' missing. IP might be flagged.")
+            logger.warning("⚠️ Browser finished but 'cf_clearance' missing. IP might be dirty.")
 
     def get_soup_browser(self, url):
         """Uses Real Chrome to get the page source (Guaranteed Bypass)."""
@@ -87,28 +92,34 @@ class FanMTLCrawler(Crawler):
             options.add_argument("--no-sandbox") 
             options.add_argument("--disable-dev-shm-usage")
             options.add_argument("--headless=new") 
+            options.add_argument(f"--user-agent={self.user_agent}")
             options.add_argument(f'--proxy-server={self.proxy_url}')
+            
+            # Anti-detection flags
+            options.add_argument("--disable-blink-features=AutomationControlled")
+            options.add_experimental_option("excludeSwitches", ["enable-automation"])
+            options.add_experimental_option('useAutomationExtension', False)
             
             driver = create_local(headless=True, options=options)
             driver.set_page_load_timeout(60)
             
             driver.get(url)
             
-            # Wait for Cloudflare
+            # [CRITICAL] Wait for Cloudflare to pass
+            logger.info("⏳ Waiting for page load...")
+            time.sleep(5) 
+            
+            # Force wait for a known element (The Title or Chapter List)
+            # This ensures we don't grab the "Just a moment" HTML
             try:
-                WebDriverWait(driver, 20).until_not(
-                    EC.title_contains("Just a moment")
+                WebDriverWait(driver, 25).until(
+                    lambda d: "fanmtl" in d.title.lower() or "novel" in d.title.lower()
                 )
-            except:
-                logger.warning("Browser timeout waiting for Cloudflare...")
-
-            # Wait for Chapter List
-            try:
                 WebDriverWait(driver, 10).until(
-                    EC.presence_of_element_located((By.CSS_SELECTOR, ".chapter-list, ul.chapter-list"))
+                    EC.presence_of_element_located((By.CSS_SELECTOR, "a[href*='/chapter-']"))
                 )
-            except:
-                pass # Might be a different page structure
+            except Exception:
+                logger.warning("Timed out waiting for chapter list. Dumping source for debug.")
 
             self.sync_cookies_from_driver(driver)
             return self.make_soup(driver.page_source)
@@ -122,7 +133,7 @@ class FanMTLCrawler(Crawler):
                 except: pass
 
     def get_soup_safe(self, url, headers=None):
-        """Standard request with retry logic."""
+        """Standard request with retry logic. Uses synced cookies."""
         retries = 0
         while retries < 3:
             try:
@@ -131,9 +142,15 @@ class FanMTLCrawler(Crawler):
 
                 response = self.runner.get(url, headers=req_headers, timeout=15)
                 
-                # Detect Cloudflare Page (It often returns 200 OK)
+                # [FIX] Detect Cloudflare even on 200 OK
                 if "just a moment" in response.text.lower() or "enable javascript" in response.text.lower():
-                    logger.warning("⛔ Request Blocked (Captcha Page). Retrying...")
+                    if not self.cookies_synced:
+                        logger.warning("⛔ Request Blocked. Launching solver...")
+                        # If blocked, try to solve ONE time
+                        self.get_soup_browser(url) 
+                        continue
+                    
+                    logger.warning(f"⛔ Blocked again. Retrying {retries}/3...")
                     time.sleep(2)
                     retries += 1
                     continue
@@ -150,10 +167,10 @@ class FanMTLCrawler(Crawler):
     def read_novel_info(self):
         logger.debug("Visiting %s", self.novel_url)
         
-        # [CRITICAL FIX] Use Browser for the Index Page
-        # This fixes "No chapters found" by ensuring we see the real page
+        # 1. Use BROWSER for the index to ensure we see chapters
         soup = self.get_soup_browser(self.novel_url)
 
+        # 2. Parse Info
         possible_title = soup.select_one("h1.novel-title")
         if possible_title:
             self.novel_title = possible_title.text.strip()
@@ -174,11 +191,11 @@ class FanMTLCrawler(Crawler):
         self.volumes = [{"id": 1, "title": "Volume 1"}]
         self.chapters = []
 
-        # Parse First Page
+        # 3. Parse Chapters (Aggressive Selector)
         self.parse_chapter_list(soup)
 
-        # Handle Pagination (FanMTL usually has all chapters or simple pagination)
-        # We try to use 'requests' for pagination since we now have cookies
+        # 4. Handle Pagination (if any)
+        # Using requests (get_soup_safe) for subsequent pages is fast
         pagination_links = soup.select('.pagination a[data-ajax-update="#chpagedlist"]')
         if pagination_links:
             try:
@@ -188,32 +205,45 @@ class FanMTLCrawler(Crawler):
                 query = parse_qs(urlparse(href).query)
                 page_params = query.get("page", ["0"])
                 
-                # Safety check for pages
                 page_count = int(page_params[0])
                 wjm = query.get("wjm", [""])[0]
                 
                 ajax_headers = {"X-Requested-With": "XMLHttpRequest"}
 
-                # Fetch other pages using the NOW SYNCED cookies
+                # Fetch pages 0 to N
                 for page in range(0, page_count + 1):
                     url = f"{common_url}?page={page}&wjm={wjm}"
-                    # We use get_soup_safe here (Requests) for speed
                     page_soup = self.get_soup_safe(url, headers=ajax_headers)
                     self.parse_chapter_list(page_soup)
                     
             except Exception as e:
                 logger.error(f"Pagination failed: {e}")
 
-        # Sort and deduplicate
+        # 5. Deduplicate and Sort
         self.chapters = list({c['url']: c for c in self.chapters}.values())
         self.chapters.sort(key=lambda x: x["id"])
 
+        if not self.chapters:
+            logger.error("❌ NO CHAPTERS FOUND. DUMPING PAGE TITLE: " + soup.title.string if soup.title else "No Title")
+            logger.error("HTML Snippet: " + str(soup)[:500])
+
     def parse_chapter_list(self, soup):
         if not soup: return
-        # Broad selector to catch multiple layouts
-        for a in soup.select(".chapter-list a, ul.chapter-list li a, .chapters a"):
+        
+        # [FIX] Aggressive Selector Strategy
+        # 1. Try standard list
+        links = soup.select(".chapter-list a, ul.chapter-list li a")
+        
+        # 2. If empty, try finding ANY link with 'chapter-' in href
+        if not links:
+            links = soup.select("a[href*='/chapter-']")
+            
+        for a in links:
             try:
                 url = self.absolute_url(a["href"])
+                # Avoid duplicates inside the loop
+                if any(x['url'] == url for x in self.chapters): continue
+
                 title_tag = a.select_one(".chapter-title")
                 title = title_tag.text.strip() if title_tag else a.text.strip()
                 
@@ -227,7 +257,7 @@ class FanMTLCrawler(Crawler):
 
     def download_chapter_body(self, chapter):
         try:
-            # Uses the fast session with cookies synced from the browser
+            # Use the high-speed runner
             soup = self.get_soup_safe(chapter["url"])
             body = soup.select_one("#chapter-article .chapter-content, .chapter-content")
             return self.cleaner.extract_contents(body).strip() if body else ""
