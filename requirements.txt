@@ -31,6 +31,7 @@ tenacity>=9.0.0
 # [CRITICAL] Cloudflare Bypass Tools
 undetected-chromedriver>=3.5.5
 pyvirtualdisplay>=3.0
+DrissionPage>=4.0.0
 curl_cffi>=0.7.0
 
 cloudscraper>=1.2.71
