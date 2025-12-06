@@ -1,7 +1,7 @@
 # Base image
 FROM python:3.10-slim
 
-# 1. Install system build dependencies + Chromium for Selenium
+# 1. Install system build dependencies + Chromium + XVFB (Virtual Monitor)
 RUN apt-get update && apt-get install -y \
 gcc \
 g++ \
@@ -15,6 +15,8 @@ libssl-dev \
 libjemalloc2 \
 chromium \
 chromium-driver \
+xvfb \
+x11-utils \
 && rm -rf /var/lib/apt/lists/*
 
 # Set work directory
@@ -29,6 +31,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # 4. Copy project files
 COPY . .
+
 # 5. IMPORTANT: Optimization Flags
 ENV LNCRAWL_MODE="production"
 ENV PYTHONUNBUFFERED=1
