@@ -1,7 +1,7 @@
 # Base image
 FROM python:3.10-slim
 
-# 1. Install system build dependencies + Chromium + XVFB (Virtual Monitor)
+# 1. Install system build dependencies + Chromium + XVFB + FONTS (Critical for Canvas Fingerprint)
 RUN apt-get update && apt-get install -y \
 gcc \
 g++ \
@@ -17,6 +17,8 @@ chromium \
 chromium-driver \
 xvfb \
 x11-utils \
+fonts-liberation \
+libfontconfig1 \
 && rm -rf /var/lib/apt/lists/*
 
 # Set work directory
@@ -32,7 +34,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 # 4. Copy project files
 COPY . .
 
-# 5. IMPORTANT: Optimization Flags
+# 5. Optimization Flags
 ENV LNCRAWL_MODE="production"
 ENV PYTHONUNBUFFERED=1
 ENV LD_PRELOAD="/usr/lib/x86_64-linux-gnu/libjemalloc.so.2"

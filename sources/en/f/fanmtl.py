@@ -3,7 +3,6 @@ import logging
 import time
 import shutil
 import random
-import json
 from urllib.parse import urlparse, parse_qs 
 from bs4 import BeautifulSoup
 from lncrawl.models import Chapter
@@ -15,8 +14,6 @@ from pyvirtualdisplay import Display
 from curl_cffi import requests as cffi_requests
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.action_chains import ActionChains
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
 
 logger = logging.getLogger(__name__)
 
@@ -25,60 +22,48 @@ class FanMTLCrawler(Crawler):
     base_url = "https://www.fanmtl.com/"
 
     def initialize(self):
-        # [TURBO] 50 threads
-        self.init_executor(50) 
+        # [VIDEO COMPLIANCE] "Scrape slowly"
+        # 50 threads triggers the "Behavioral Analysis" block (Video 2)
+        # We lower this to 5 to survive.
+        self.init_executor(5) 
         
-        # 1. Setup the RUNNER (TLS Impersonation)
-        # Upgraded to chrome124 to match modern browser fingerprints
-        self.runner = cffi_requests.Session(impersonate="chrome124")
+        # 1. Setup the RUNNER
+        self.runner = cffi_requests.Session(impersonate="chrome120")
         
-        # Use a consistent User-Agent for Linux (Docker)
-        self.user_agent = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+        # Use a generic Linux UA that matches the Docker Chromium
+        self.user_agent = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         
         self.runner.headers.update({
             "User-Agent": self.user_agent,
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.9",
             "Referer": "https://www.fanmtl.com/",
-            "Upgrade-Insecure-Requests": "1",
-            # [FIX] Add Client Hints to satisfy strict Origin servers
-            "Sec-Ch-Ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
-            "Sec-Ch-Ua-Mobile": "?0",
-            "Sec-Ch-Ua-Platform": '"Linux"',
-            "Sec-Fetch-Dest": "document",
-            "Sec-Fetch-Mode": "navigate",
-            "Sec-Fetch-Site": "same-origin",
-            "Sec-Fetch-User": "?1",
         })
         
-        # WARP Proxy Configuration
-        # If 520 persists, try commenting these out to use your VPS IP directly
-    #    self.proxy_ip = "127.0.0.1"
-    #    self.proxy_port = "40000"
-     #   self.chrome_proxy = f"socks5://{self.proxy_ip}:{self.proxy_port}"
-       # self.requests_proxy = f"socks5h://{self.proxy_ip}:{self.proxy_port}"
+        # WARP Proxy
+        self.proxy_ip = "127.0.0.1"
+        self.proxy_port = "40000"
+        self.chrome_proxy = f"socks5://{self.proxy_ip}:{self.proxy_port}"
+        self.requests_proxy = f"socks5h://{self.proxy_ip}:{self.proxy_port}"
 
-    #    self.runner.proxies = {
-         #   "http": self.requests_proxy,
-     #       "https": self.requests_proxy
-       # }
+        self.runner.proxies = {
+            "http": self.requests_proxy,
+            "https": self.requests_proxy
+        }
 
         self.scraper = self.runner
         self.cookies_synced = False
         self.cleaner.bad_css.update({'div[align="center"]'})
-        logger.info("FanMTL Strategy: Virtual Display -> Header Alignment -> Cookie Diet")
+        logger.info("FanMTL Strategy: Canvas Fonts + Throttling + TLS")
 
     def sync_cookies_from_driver(self, driver):
-        """Extracts ONLY critical Cloudflare cookies to prevent Header Bloat (520 Error)."""
+        """Extracts valid Cloudflare cookies."""
         cookies = driver.get_cookies()
         found_cf = False
         
-        # Clear existing to prevent conflicts
         self.runner.cookies.clear()
         
         for cookie in cookies:
-            # [CRITICAL FIX] Only keep Cloudflare cookies. 
-            # Junk cookies from ads/tracking often cause 520 errors on the Origin.
+            # Only keep essential Cloudflare cookies (Video 1 Tip: Real Request Headers)
             if cookie['name'] in ['cf_clearance', '__cf_bm']:
                 self.runner.cookies.set(
                     cookie['name'], 
@@ -89,31 +74,34 @@ class FanMTLCrawler(Crawler):
                 if cookie['name'] == 'cf_clearance':
                     found_cf = True
         
+        # [IMPORTANT] Update UA to match the browser exactly
+        ua = driver.execute_script("return navigator.userAgent")
+        self.runner.headers['User-Agent'] = ua
+        
         if found_cf:
-            logger.info("✅ Cookies Synced: Clean Cloudflare Clearance Obtained")
+            logger.info("✅ Cookies Synced")
             self.cookies_synced = True
             return True
         return False
 
     def simulate_human(self, driver):
-        """Moves mouse to trigger passive checks."""
+        """Moves mouse randomly (Video 2: Simulate human interactions)."""
         try:
             action = ActionChains(driver)
-            for _ in range(2):
-                x = random.randint(0, 300)
-                y = random.randint(0, 300)
-                action.move_by_offset(x, y).perform()
-                action.reset_actions()
-                time.sleep(0.2)
+            x = random.randint(0, 500)
+            y = random.randint(0, 500)
+            action.move_by_offset(x, y).perform()
+            action.reset_actions()
         except: pass
 
     def get_soup_browser(self, url):
-        """Uses Undetected-Chromedriver with 520 Error Recovery."""
+        """Uses Undetected-Chromedriver with Virtual Display & Fonts."""
         logger.info(f"🌍 Browser fetching: {url}")
         driver = None
         display = None
         
         try:
+            # Start Virtual Display (Passes 'Headless' check)
             display = Display(visible=0, size=(1920, 1080))
             display.start()
 
@@ -123,10 +111,8 @@ class FanMTLCrawler(Crawler):
             options = uc.ChromeOptions()
             options.add_argument("--no-sandbox") 
             options.add_argument("--disable-dev-shm-usage")
-            #options.add_argument(f'--proxy-server={self.chrome_proxy}')
+            options.add_argument(f'--proxy-server={self.chrome_proxy}')
             options.add_argument("--disable-popup-blocking")
-            # [FIX] Force specific UA in browser to match curl_cffi
-            options.add_argument(f"--user-agent={self.user_agent}")
             
             driver = uc.Chrome(
                 options=options,
@@ -134,33 +120,27 @@ class FanMTLCrawler(Crawler):
                 browser_executable_path=browser_path,
                 use_subprocess=True,
                 headless=False,
-                version_main=124 # Match chrome version if possible
+                version_main=120
             )
             
             driver.set_page_load_timeout(120)
             driver.get(url)
             
-            logger.info("⏳ Waiting for page load (Checking for 520/Challenge)...")
             start_time = time.time()
-            
             while time.time() - start_time < 90:
-                page_source = driver.page_source.lower()
-                title = driver.title.lower()
-
-                # [FIX] Handle 520 Error (Server Reset)
-                # If we see 520, we MUST clear cookies and retry.
-                if "520" in title or "web server is returning an unknown error" in page_source:
-                    logger.warning("⚠️ 520 Origin Error. Cleaning session and reloading...")
+                # Handle 520 / 403
+                if "520" in driver.title or "403" in driver.title:
+                    logger.warning("⚠️ Access Error. Refreshing...")
                     driver.delete_all_cookies()
                     time.sleep(2)
                     driver.refresh()
                     time.sleep(5)
                     continue
 
-                # Handle "Just a moment"
-                if "just a moment" in title or "challenge" in page_source:
+                # Handle Cloudflare
+                if "Just a moment" in driver.title or "challenge" in driver.page_source.lower():
                     self.simulate_human(driver)
-                    # Try to click iframes
+                    # Try clicking iframes
                     try:
                         iframes = driver.find_elements(By.TAG_NAME, "iframe")
                         for frame in iframes:
@@ -169,16 +149,13 @@ class FanMTLCrawler(Crawler):
                                     driver.switch_to.frame(frame)
                                     driver.find_element(By.CSS_SELECTOR, "body").click()
                                     driver.switch_to.default_content()
-                            except: 
-                                driver.switch_to.default_content()
+                            except: driver.switch_to.default_content()
                     except: pass
                     time.sleep(2)
                     continue
 
-                # Success Condition
-                if "fanmtl" in title or "novel" in title or "chapter" in page_source:
+                if "fanmtl" in driver.title.lower() or "novel" in driver.title.lower():
                     if self.sync_cookies_from_driver(driver):
-                        logger.info("🔓 Bypass Successful!")
                         break
                 
                 time.sleep(1)
@@ -197,20 +174,21 @@ class FanMTLCrawler(Crawler):
                 except: pass
 
     def get_soup_safe(self, url, headers=None):
+        """Requests with Random Delays (Video 2 Tip)."""
+        # [VIDEO COMPLIANCE] "Incorporate random delays"
+        time.sleep(random.uniform(1.5, 3.5)) 
+        
         retries = 0
         while retries < 3:
             try:
                 response = self.runner.get(url, timeout=15)
                 
-                # Check for blocks
                 if "just a moment" in response.text.lower() or response.status_code == 520:
                     if not self.cookies_synced:
-                        logger.warning("⛔ Request Blocked. Launching solver...")
                         self.get_soup_browser(url) 
                         continue
                     
-                    logger.warning(f"⛔ Blocked ({response.status_code}). Retrying...")
-                    time.sleep(2)
+                    time.sleep(5)
                     retries += 1
                     continue
 
@@ -219,7 +197,7 @@ class FanMTLCrawler(Crawler):
                     
                 return self.make_soup(response.content)
             except Exception:
-                time.sleep(1)
+                time.sleep(2)
                 retries += 1
         
         return self.make_soup("<html></html>")
@@ -244,20 +222,19 @@ class FanMTLCrawler(Crawler):
 
         self.parse_chapter_list(soup)
 
-        # Pagination using fast cffi_requests
+        # Pagination
         pagination_links = soup.select('.pagination a[data-ajax-update="#chpagedlist"]')
         if pagination_links:
             try:
                 last_page = pagination_links[-1]
-                href = last_page.get("href")
-                common_url = self.absolute_url(href).split("?")[0]
-                query = parse_qs(urlparse(href).query)
-                page_params = query.get("page", ["0"])
-                page_count = int(page_params[0])
+                common_url = self.absolute_url(last_page.get("href")).split("?")[0]
+                query = parse_qs(urlparse(last_page.get("href")).query)
+                page_count = int(query.get("page", ["0"])[0])
                 wjm = query.get("wjm", [""])[0]
                 
                 for page in range(0, page_count + 1):
                     url = f"{common_url}?page={page}&wjm={wjm}"
+                    # Use safe request with delays
                     page_soup = self.get_soup_safe(url)
                     self.parse_chapter_list(page_soup)
                     
