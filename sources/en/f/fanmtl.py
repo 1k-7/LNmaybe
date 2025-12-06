@@ -53,15 +53,15 @@ class FanMTLCrawler(Crawler):
         
         # WARP Proxy Configuration
         # If 520 persists, try commenting these out to use your VPS IP directly
-        self.proxy_ip = "127.0.0.1"
-        self.proxy_port = "40000"
-        self.chrome_proxy = f"socks5://{self.proxy_ip}:{self.proxy_port}"
-        self.requests_proxy = f"socks5h://{self.proxy_ip}:{self.proxy_port}"
+    #    self.proxy_ip = "127.0.0.1"
+    #    self.proxy_port = "40000"
+     #   self.chrome_proxy = f"socks5://{self.proxy_ip}:{self.proxy_port}"
+       # self.requests_proxy = f"socks5h://{self.proxy_ip}:{self.proxy_port}"
 
-        self.runner.proxies = {
-            "http": self.requests_proxy,
-            "https": self.requests_proxy
-        }
+    #    self.runner.proxies = {
+         #   "http": self.requests_proxy,
+     #       "https": self.requests_proxy
+       # }
 
         self.scraper = self.runner
         self.cookies_synced = False
