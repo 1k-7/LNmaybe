@@ -7,7 +7,7 @@ from bs4 import BeautifulSoup
 from lncrawl.models import Chapter
 from lncrawl.core.crawler import Crawler
 
-# Import Selenium (Already in your requirements)
+# Import Selenium
 from lncrawl.webdriver.local import create_local
 from selenium.webdriver import ChromeOptions
 
@@ -25,13 +25,15 @@ class FanMTLCrawler(Crawler):
         self.runner = requests.Session()
         
         self.runner.headers.update({
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
             "Accept-Language": "en-US,en;q=0.9",
             "Referer": "https://www.fanmtl.com/",
             "Upgrade-Insecure-Requests": "1",
         })
         
-        # Force traffic through WARP (socks5h = Remote DNS resolution)
+        # Force traffic through WARP
+        # Ensure your WARP proxy is actually running on this port!
         self.proxy_url = "socks5h://127.0.0.1:40000"
         self.runner.proxies = {
             "http": self.proxy_url,
@@ -43,7 +45,7 @@ class FanMTLCrawler(Crawler):
         self.runner.mount("https://", adapter)
         self.runner.mount("http://", adapter)
 
-        # Expose runner to the bot for cover downloading
+        # Expose runner
         self.scraper = self.runner
 
         self.cookies_synced = False
@@ -58,15 +60,18 @@ class FanMTLCrawler(Crawler):
             options = ChromeOptions()
             options.add_argument("--no-sandbox") 
             options.add_argument("--disable-dev-shm-usage")
+            options.add_argument("--headless=new") # Modern headless mode
             options.add_argument(f'--proxy-server={self.proxy_url}')
             
             driver = create_local(headless=True, options=options)
             
             driver.get(url)
-            time.sleep(10)
-            if "Just a moment" in driver.title:
-                logger.info("Browser: Solving challenge...")
-                time.sleep(10)
+            time.sleep(8) # Wait for initial load
+            
+            # Check Title
+            if "Just a moment" in driver.title or "challenge" in driver.page_source.lower():
+                logger.info("Browser: Detected Challenge. Waiting for solve...")
+                time.sleep(15) # Give it time to solve
 
             cookies = driver.get_cookies()
             ua = driver.execute_script("return navigator.userAgent")
@@ -79,7 +84,7 @@ class FanMTLCrawler(Crawler):
                     domain=cookie.get('domain', ''),
                     path=cookie.get('path', '/')
                 )
-                if cookie['name'] == 'cf_clearance':
+                if 'cf_clearance' in cookie['name']:
                     found_cf = True
             
             if ua:
@@ -89,7 +94,7 @@ class FanMTLCrawler(Crawler):
                 logger.info("✅ Solver Success! Cookies synced. Resuming Turbo Mode.")
                 self.cookies_synced = True
             else:
-                logger.warning("⚠️ Browser finished but 'cf_clearance' missing. Might still work if IP is clean.")
+                logger.warning("⚠️ Browser finished but 'cf_clearance' missing. IP might be dirty.")
             
         except Exception as e:
             logger.critical(f"❌ Browser Solver Failed: {e}")
@@ -102,23 +107,32 @@ class FanMTLCrawler(Crawler):
     def get_soup_safe(self, url, headers=None):
         """Smart wrapper: Fails fast -> Calls Solver -> Retries"""
         retries = 0
+        max_retries = 2
         while True:
             try:
                 req_headers = self.runner.headers.copy()
                 if headers: req_headers.update(headers)
 
                 # STEP 1: Try Fast Runner
-                response = self.runner.get(url, headers=req_headers, timeout=15)
+                response = self.runner.get(url, headers=req_headers, timeout=20)
                 
-                # Check for Challenge Page
-                if response.status_code in [403, 503] and "just a moment" in response.text.lower():
-                    if retries == 0:
-                        logger.warning("⛔ Turbo session blocked. refreshing cookies...")
+                # [FIXED] Detect Challenge even on 200 OK
+                # FanMTL often returns 200 for the "Just a moment" page
+                is_challenge = (
+                    "just a moment" in response.text.lower() or 
+                    "challenge-platform" in response.text.lower() or
+                    "enable javascript" in response.text.lower()
+                )
+
+                if response.status_code in [403, 503, 429] or is_challenge:
+                    if retries < max_retries:
+                        logger.warning(f"⛔ Turbo session blocked (Status: {response.status_code}). Refreshing cookies...")
                         self.refresh_cookies(url)
                         retries += 1
                         continue
                     else:
-                        raise Exception("Cloudflare Loop (Solver failed)")
+                        logger.error("❌ Cloudflare Loop: Solver failed to clear the block.")
+                        raise Exception("Cloudflare Loop")
 
                 response.raise_for_status()
                 return self.make_soup(response)
@@ -129,9 +143,9 @@ class FanMTLCrawler(Crawler):
                     logger.error(f"Permanent Error (404): {url}")
                     return self.make_soup("<html></html>")
 
-                if retries < 3:
+                if retries < max_retries:
                     logger.warning(f"Request Error: {e}. Retrying...")
-                    time.sleep(3)
+                    time.sleep(2)
                     retries += 1
                     continue
                 
@@ -166,8 +180,10 @@ class FanMTLCrawler(Crawler):
         self.volumes = [{"id": 1, "title": "Volume 1"}]
         self.chapters = []
 
+        # Parse First Page
         self.parse_chapter_list(soup)
 
+        # Handle Pagination
         pagination_links = soup.select('.pagination a[data-ajax-update="#chpagedlist"]')
         if pagination_links:
             try:
@@ -176,12 +192,18 @@ class FanMTLCrawler(Crawler):
                 common_url = self.absolute_url(href).split("?")[0]
                 query = parse_qs(urlparse(href).query)
                 page_params = query.get("page", ["0"])
-                page_count = int(page_params[0]) + 1
+                
+                # Usually page 0 is the first page we already parsed, but FanMTL pages can be tricky.
+                # We check all pages to be safe.
+                page_count = int(page_params[0])
                 wjm = query.get("wjm", [""])[0]
                 
                 ajax_headers = {"X-Requested-With": "XMLHttpRequest"}
 
-                for page in range(page_count):
+                # Start from page 1 if page 0 is the landing page
+                for page in range(0, page_count + 1):
+                    # Skip page 0 if we assume it's the main page (optional optimization)
+                    # But often safe to just re-parse to ensure complete list
                     url = f"{common_url}?page={page}&wjm={wjm}"
                     page_soup = self.get_soup_safe(url, headers=ajax_headers)
                     self.parse_chapter_list(page_soup)
@@ -189,18 +211,24 @@ class FanMTLCrawler(Crawler):
             except Exception as e:
                 logger.error(f"Pagination failed: {e}")
 
-        self.chapters.sort(key=lambda x: x["id"] if isinstance(x, dict) else getattr(x, "id", 0))
+        # Sort and deduplicate
+        self.chapters = list({c['url']: c for c in self.chapters}.values())
+        self.chapters.sort(key=lambda x: x["id"])
 
     def parse_chapter_list(self, soup):
         if not soup: return
-        for a in soup.select("ul.chapter-list li a"):
+        # [FIXED] More generic selector
+        for a in soup.select(".chapter-list a"):
             try:
                 url = self.absolute_url(a["href"])
+                title = a.select_one(".chapter-title")
+                title = title.text.strip() if title else a.text.strip()
+                
                 self.chapters.append(Chapter(
                     id=len(self.chapters) + 1,
                     volume=1,
                     url=url,
-                    title=a.select_one(".chapter-title").text.strip(),
+                    title=title,
                 ))
             except: pass
 
