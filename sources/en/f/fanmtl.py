@@ -1,187 +1,124 @@
 # -*- coding: utf-8 -*-
 import logging
+import requests
 import time
-import shutil
-import random
-from threading import Lock
 from urllib.parse import urlparse, parse_qs 
 from bs4 import BeautifulSoup
 from lncrawl.models import Chapter
 from lncrawl.core.crawler import Crawler
 
-# [CRITICAL] Bypass Tools
-from DrissionPage import ChromiumPage, ChromiumOptions
-from pyvirtualdisplay import Display
-from curl_cffi import requests as cffi_requests
-
 logger = logging.getLogger(__name__)
+
+# [CONFIGURATION]
+# 1. The URL of your Render Proxy App
+RENDER_PROXY_URL = "https://YOUR-APP-NAME.onrender.com" 
+
+# 2. The Deploy Hook URL from Render (Settings -> Build & Deploy -> Deploy Hook)
+# KEEP THIS SECRET!
+RENDER_DEPLOY_HOOK = "https://api.render.com/deploy/srv-xxxxxx?key=xxxxxx"
 
 class FanMTLCrawler(Crawler):
     has_mtl = True
     base_url = "https://www.fanmtl.com/"
 
     def initialize(self):
-        # [TURBO] 60 Threads
+        # [TURBO] 60 Threads is SAFE because we rotate IPs via Render
         self.init_executor(40) 
         
-        # 1. Setup the RUNNER
-        self.runner = cffi_requests.Session(impersonate="chrome120")
-        
-        # Use Linux UA to match Docker
-        self.user_agent = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        
-        self.runner.headers.update({
-            "User-Agent": self.user_agent,
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-            "Referer": "https://www.fanmtl.com/",
-        })
-        
-        # WARP Proxy
-        self.proxy_ip = "127.0.0.1"
-        self.proxy_port = "40000"
-        self.chrome_proxy = f"socks5://{self.proxy_ip}:{self.proxy_port}"
-        self.requests_proxy = f"socks5h://{self.proxy_ip}:{self.proxy_port}"
-
-        # Enable Proxy
-        self.runner.proxies = {
-            "http": self.requests_proxy,
-            "https": self.requests_proxy
-        }
-
-        self.scraper = self.runner
-        self.cookies_synced = False
+        self.bridge = requests.Session()
         self.cleaner.bad_css.update({'div[align="center"]'})
-        logger.info("FanMTL Strategy: Browser Source -> CFFI Downloader")
+        logger.info(f"FanMTL Strategy: Auto-Rotating Render Proxy")
 
-    def solve_captcha(self, url):
-        """Launches DrissionPage to solve Cloudflare and RETURN HTML."""
-        logger.info(f"🛡️ Launching Solver: {url}")
-        display = None
-        page = None
+    def trigger_redeploy_and_wait(self):
+        """Hits the Render Deploy Hook and waits for the service to return with a new IP."""
+        logger.critical("♻️ TRIGGERING RENDER REDEPLOYMENT (New IP)...")
         
         try:
-            # 1. Start Virtual Display
-            display = Display(visible=0, size=(1920, 1080))
-            display.start()
-
-            # 2. Configure Chromium
-            co = ChromiumOptions()
-            co.set_argument("--no-sandbox")
-            co.set_argument("--disable-dev-shm-usage")
-            co.set_argument("--disable-gpu")
-            co.set_argument("--disable-popup-blocking")
-            co.set_argument(f"--user-agent={self.user_agent}")
-            co.set_argument(f"--proxy-server={self.chrome_proxy}")
+            # 1. Trigger Hook
+            self.bridge.get(RENDER_DEPLOY_HOOK)
+            logger.info("⏳ Deployment started. Waiting for service to go down...")
             
-            browser_path = shutil.which("chromium") or "/usr/bin/chromium"
-            co.set_browser_path(browser_path)
-
-            page = ChromiumPage(addr_or_opts=co)
+            # 2. Wait for service to restart (approx 2-4 minutes)
+            # We poll the health endpoint until it returns 200 OK
+            health_url = f"{RENDER_PROXY_URL}/"
             
-            # 3. Load Page
-            page.get(url)
+            # Initial wait to let Render start the process
+            time.sleep(30)
             
-            logger.info("⏳ Analyzing Page...")
-            start_time = time.time()
-            
-            # 4. Solve Loop
-            while time.time() - start_time < 90:
-                title = page.title.lower()
-                
-                # 520 Error
-                if "520" in title:
-                    logger.warning("⚠️ 520 Error. Refreshing...")
-                    page.refresh()
-                    time.sleep(5)
-                    continue
-
-                # Cloudflare check
-                if "just a moment" not in title and "challenge" not in page.html.lower():
-                    # Wait for actual content
-                    if "fanmtl" in title or "novel" in title:
-                        logger.info("🔓 Cloudflare Bypassed! Page Loaded.")
-                        break
-
+            start_wait = time.time()
+            while time.time() - start_wait < 600: # Wait up to 10 mins
                 try:
-                    ele = page.ele('@src^https://challenges.cloudflare.com')
-                    if ele:
-                        ele.click()
-                        time.sleep(2)
-                except: pass
+                    resp = self.bridge.get(health_url, timeout=5)
+                    if resp.status_code == 200 and resp.json().get("status") == "alive":
+                        logger.info("✅ Render Service is BACK ONLINE! Resuming crawl.")
+                        return True
+                except:
+                    # Connection error means it's still deploying/restarting
+                    pass
                 
-                time.sleep(1)
-
-            # 5. Extract Cookies (Robust)
-            # Try multiple methods to get the cookie
-            cookies_list = page.cookies() # List of dicts
+                logger.info("💤 Waiting for Render to come online...")
+                time.sleep(10)
             
-            self.runner.cookies.clear()
-            found_cf = False
-            
-            for cookie in cookies_list:
-                name = cookie.get('name')
-                value = cookie.get('value')
-                if name == 'cf_clearance':
-                    found_cf = True
-                self.runner.cookies.set(name, value, domain=".fanmtl.com")
-
-            if found_cf:
-                logger.info("✅ Cookies Synced Successfully")
-                self.cookies_synced = True
-            else:
-                logger.warning("⚠️ No cf_clearance found. Downloader might fail, but indexing will proceed.")
-
-            # [CRITICAL FIX] Return the Browser's HTML directly
-            # This ensures we have the content even if cookie transfer fails
-            return page.html
+            logger.error("❌ Render Redeploy Timed Out.")
+            return False
 
         except Exception as e:
-            logger.error(f"Solver Crash: {e}")
-            return None
-        finally:
-            if page: page.quit()
-            if display: display.stop()
+            logger.error(f"Redeploy Failed: {e}")
+            return False
 
-    def get_soup_safe(self, url, headers=None):
+    def fetch_via_render(self, target_url):
+        """Sends URL to Render App -> Returns HTML. Handles Block -> Redeploy Loop."""
         retries = 0
         while retries < 3:
             try:
-                # If not synced, try to solve
-                if not self.cookies_synced:
-                    html = self.solve_captcha(url)
-                    if html: return self.make_soup(html)
-
-                # Fast Request
-                response = self.runner.get(url, timeout=20)
+                # Send the URL to your Render Proxy (/fetch endpoint)
+                response = self.bridge.post(
+                    f"{RENDER_PROXY_URL}/fetch", 
+                    json={"url": target_url}, 
+                    timeout=60 # Give Render time to fetch
+                )
                 
-                if "just a moment" in response.text.lower() or response.status_code in [403, 520, 503]:
-                    logger.warning(f"⛔ Blocked ({response.status_code}). Re-solving...")
-                    self.cookies_synced = False
-                    time.sleep(2)
-                    retries += 1
+                if response.status_code != 200:
+                    # 502/503 means Render is restarting/down
+                    logger.warning(f"Render Gateway Error ({response.status_code}). Waiting...")
+                    time.sleep(10)
                     continue
 
-                response.raise_for_status()
-                return self.make_soup(response.content)
+                data = response.json()
+                
+                # [BLOCK DETECTION]
+                if data.get("status") == "blocked":
+                    logger.warning(f"⛔ Render IP Blocked! Initiating Rotation...")
+                    
+                    # Call the hook to get a new IP
+                    if self.trigger_redeploy_and_wait():
+                        retries = 0 # Reset retries on success
+                        continue
+                    else:
+                        return None # Redeploy failed
+                    
+                if data.get("status") == "success":
+                    return data.get("html")
+                
+                # Other errors (404, etc)
+                logger.error(f"Proxy Error: {data.get('message')}")
+                return None
 
-            except Exception:
-                time.sleep(1)
+            except Exception as e:
+                logger.warning(f"Bridge Connection Issue: {e}")
+                time.sleep(5)
                 retries += 1
         
-        return self.make_soup("<html></html>")
+        return None
 
     def read_novel_info(self):
         logger.debug("Visiting %s", self.novel_url)
         
-        # [CRITICAL] Always use Browser for the Index Page
-        # This guarantees we see the chapters if they exist
-        html = self.solve_captcha(self.novel_url)
-        
-        if html:
-            soup = self.make_soup(html)
-        else:
-            # Fallback (unlikely to work if browser failed)
-            soup = self.get_soup_safe(self.novel_url)
+        html = self.fetch_via_render(self.novel_url)
+        if not html:
+            raise Exception("Failed to load novel info (Proxy Failure)")
+
+        soup = self.make_soup(html)
 
         possible_title = soup.select_one("h1.novel-title")
         if possible_title:
@@ -199,7 +136,6 @@ class FanMTLCrawler(Crawler):
 
         self.parse_chapter_list(soup)
 
-        # Pagination
         pagination_links = soup.select('.pagination a[data-ajax-update="#chpagedlist"]')
         if pagination_links:
             try:
@@ -211,11 +147,11 @@ class FanMTLCrawler(Crawler):
                 page_count = int(page_params[0])
                 wjm = query.get("wjm", [""])[0]
                 
-                # Fetch other pages using the synchronized session
                 for page in range(0, page_count + 1):
                     url = f"{common_url}?page={page}&wjm={wjm}"
-                    page_soup = self.get_soup_safe(url)
-                    self.parse_chapter_list(page_soup)
+                    html_page = self.fetch_via_render(url)
+                    if html_page:
+                        self.parse_chapter_list(self.make_soup(html_page))
                     
             except Exception as e:
                 logger.error(f"Pagination failed: {e}")
@@ -224,10 +160,7 @@ class FanMTLCrawler(Crawler):
         self.chapters.sort(key=lambda x: x["id"])
 
         if not self.chapters:
-            logger.error(f"❌ NO CHAPTERS FOUND. (Title: {self.novel_title})")
-            # If title is Unknown, we definitely failed the bypass
-            if self.novel_title == "Unknown":
-                logger.error("Dumping HTML Snippet: " + str(soup)[:500])
+            logger.warning(f"⚠️ 0 Chapters found for {self.novel_title}")
 
     def parse_chapter_list(self, soup):
         if not soup: return
@@ -239,15 +172,14 @@ class FanMTLCrawler(Crawler):
             try:
                 url = self.absolute_url(a["href"])
                 if any(x['url'] == url for x in self.chapters): continue
-                title_tag = a.select_one(".chapter-title")
-                title = title_tag.text.strip() if title_tag else a.text.strip()
+                title = a.text.strip()
                 self.chapters.append(Chapter(id=len(self.chapters)+1, volume=1, url=url, title=title))
             except: pass
 
     def download_chapter_body(self, chapter):
-        try:
-            soup = self.get_soup_safe(chapter["url"])
-            body = soup.select_one("#chapter-article .chapter-content, .chapter-content")
-            return self.cleaner.extract_contents(body).strip() if body else ""
-        except Exception:
-            return ""
+        html = self.fetch_via_render(chapter["url"])
+        if not html: return ""
+        
+        soup = self.make_soup(html)
+        body = soup.select_one("#chapter-article .chapter-content, .chapter-content")
+        return self.cleaner.extract_contents(body).strip() if body else ""
