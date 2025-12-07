@@ -23,7 +23,7 @@ class FanMTLCrawler(Crawler):
         # [TURBO] 50 Threads
         self.init_executor(50) 
         
-        # 1. Setup the RUNNER (Placeholder, will be updated by Browser)
+        # 1. Setup the RUNNER
         self.runner = cffi_requests.Session(impersonate="chrome120")
         
         # WARP Proxy (Optional - Comment out if VPS IP is better)
@@ -38,16 +38,16 @@ class FanMTLCrawler(Crawler):
         self.scraper = self.runner
         self.cookies_synced = False
         self.cleaner.bad_css.update({'div[align="center"]'})
-        logger.info("FanMTL Strategy: DrissionPage Shadow-Clicker -> CFFI")
+        logger.info("FanMTL Strategy: DrissionPage (Fix) -> CFFI")
 
     def solve_captcha(self, url):
-        """Launches DrissionPage to solve Cloudflare Turnstile via Shadow DOM."""
+        """Launches DrissionPage to solve Cloudflare Turnstile."""
         logger.info(f"🛡️ Launching Solver: {url}")
         display = None
         page = None
         
         try:
-            # 1. Start Virtual Display (Bypass 'Headless' Check)
+            # 1. Start Virtual Display
             display = Display(visible=0, size=(1920, 1080))
             display.start()
 
@@ -56,13 +56,8 @@ class FanMTLCrawler(Crawler):
             co.set_argument("--no-sandbox")
             co.set_argument("--disable-dev-shm-usage")
             co.set_argument("--disable-gpu")
+            co.set_argument("--disable-popup-blocking")
             
-            # [CRITICAL] Let the browser choose its own natural User-Agent
-            # We will copy it later. Do NOT force a mismatch.
-            
-            # Use Proxy if enabled
-            # co.set_argument(f"--proxy-server=socks5://{self.proxy_ip}:{self.proxy_port}")
-
             browser_path = shutil.which("chromium") or "/usr/bin/chromium"
             co.set_browser_path(browser_path)
 
@@ -91,45 +86,42 @@ class FanMTLCrawler(Crawler):
                     time.sleep(5)
                     continue
 
-                # [CRITICAL] TURNSTILE CLICKER (Shadow DOM)
-                # DrissionPage can find shadow roots easily.
+                # Turnstile Clicker
                 try:
-                    # Look for the turnstile iframe
                     ele = page.ele('@src^https://challenges.cloudflare.com')
                     if ele:
-                        logger.info("👉 Found Turnstile. Attempting click...")
-                        # Click the body inside the iframe
                         ele.click()
                         time.sleep(2)
-                except: 
-                    pass
+                except: pass
                 
                 time.sleep(1)
 
-            # 5. Extract Session Data
-            cookies = page.cookies(as_dict=True)
+            # 5. Extract Session Data [FIXED CRASH]
+            # DrissionPage v4 cookies() returns a list of dicts, does not accept as_dict=True
+            cookies_list = page.cookies() 
             ua = page.run_js("return navigator.userAgent")
             
             # 6. Verify Clearance
             found_cf = False
             self.runner.cookies.clear()
             
-            for name, value in cookies.items():
+            for cookie in cookies_list:
+                name = cookie.get('name')
+                value = cookie.get('value')
+                
                 if name == 'cf_clearance':
                     found_cf = True
+                
+                # Set cookie in runner
                 self.runner.cookies.set(name, value, domain=".fanmtl.com")
             
             if found_cf:
                 logger.info("✅ CF-Clearance Obtained!")
-                # [CRITICAL] Update Runner to MATCH Browser
                 self.runner.headers['User-Agent'] = ua
                 self.cookies_synced = True
                 return page.html
             else:
-                logger.error("❌ Solver Failed: No cf_clearance cookie.")
-                # Debug Dump
-                with open("debug_failed_solve.html", "w", encoding="utf-8") as f:
-                    f.write(page.html)
+                logger.error("❌ Solver Failed: No cf_clearance cookie found in list.")
                 return None
 
         except Exception as e:
@@ -143,16 +135,13 @@ class FanMTLCrawler(Crawler):
         retries = 0
         while retries < 3:
             try:
-                # Solve if not synced
                 if not self.cookies_synced:
                     self.solve_captcha(url)
                     if not self.cookies_synced:
                         raise Exception("Solver failed")
 
-                # Fast Request
                 response = self.runner.get(url, timeout=20)
                 
-                # Block Detection
                 if "just a moment" in response.text.lower() or response.status_code in [403, 520, 503]:
                     logger.warning(f"⛔ Token Expired ({response.status_code}). Re-solving...")
                     self.cookies_synced = False
@@ -172,7 +161,6 @@ class FanMTLCrawler(Crawler):
     def read_novel_info(self):
         logger.debug("Visiting %s", self.novel_url)
         
-        # Initial Solve
         html = self.solve_captcha(self.novel_url)
         if html:
             soup = self.make_soup(html)
