@@ -26,7 +26,7 @@ class FanMTLCrawler(Crawler):
         self.proxy_url = self.proxy_url.rstrip("/")
         
         # [TURBO] 60 Threads
-        self.init_executor(60) 
+        self.init_executor(40) 
         
         # [CRITICAL FIX] Connection Pool Size
         # Must exceed thread count (60) to prevent "Connection pool is full" warnings

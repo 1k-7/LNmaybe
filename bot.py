@@ -40,8 +40,8 @@ logging.getLogger("lncrawl").setLevel(logging.WARNING)
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 
 # [SPEED OPTIMIZATION]
-THREADS_PER_NOVEL = 50     # High threads as requested
-MAX_CONCURRENT_NOVELS = 10 # Keep high concurrency
+THREADS_PER_NOVEL = 30     # High threads as requested
+MAX_CONCURRENT_NOVELS = 6 # Keep high concurrency
 
 # Group Configs (Must be -100xxxx format)
 TARGET_GROUP_ID = os.getenv("TARGET_GROUP_ID") 
