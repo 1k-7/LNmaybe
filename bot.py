@@ -40,8 +40,8 @@ logging.getLogger("lncrawl").setLevel(logging.WARNING)
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 
 # [SPEED OPTIMIZATION]
-THREADS_PER_NOVEL = 30     # High threads as requested
-MAX_CONCURRENT_NOVELS = 6 # Keep high concurrency
+THREADS_PER_NOVEL = 60
+MAX_CONCURRENT_NOVELS = 10
 
 # Group Configs (Must be -100xxxx format)
 TARGET_GROUP_ID = os.getenv("TARGET_GROUP_ID") 
@@ -90,18 +90,20 @@ def scrape_logic_worker(url, progress_queue):
             # 1. Initialize High-Thread Executor
             app.crawler.init_executor(THREADS_PER_NOVEL)
 
-            # 2. [CRITICAL FIX] Update Existing Adapters instead of replacing them
-            # This preserves the Cloudflare TLS Fingerprint while allowing high concurrency
-            if hasattr(app.crawler, 'scraper') and hasattr(app.crawler.scraper, 'adapters'):
-                for adapter in app.crawler.scraper.adapters.values():
-                    adapter.pool_connections = THREADS_PER_NOVEL
-                    adapter.pool_maxsize = THREADS_PER_NOVEL
-                    adapter.pool_block = False
+            # 2. Inject Aggressive Connection Pool (Preserve Existing)
+            if hasattr(app.crawler, 'scraper') and hasattr(app.crawler.scraper, 'mount'):
+                adapter = HTTPAdapter(
+                    pool_connections=THREADS_PER_NOVEL + 10, 
+                    pool_maxsize=THREADS_PER_NOVEL + 10,
+                    max_retries=3,
+                    pool_block=False
+                )
+                app.crawler.scraper.mount("https://", adapter)
+                app.crawler.scraper.mount("http://", adapter)
 
-        # [FIXED] Cover Image - Removed hardcoded headers that caused 403
+        # Cover Image
         if app.crawler.novel_cover:
             try:
-                # We use the crawler's scraper which HAS the valid cookies/headers
                 response = app.crawler.scraper.get(app.crawler.novel_cover, timeout=15)
                 if response.status_code == 200:
                     cover_path = os.path.abspath(os.path.join(app.output_path, 'cover.jpg'))
@@ -121,13 +123,19 @@ def scrape_logic_worker(url, progress_queue):
         if progress_queue: progress_queue.put(f"⬇️ Downloading {total} chapters...")
         
         count = 0
+        last_update_time = time.time()
+        
         for i, _ in enumerate(app.start_download()):
             count += 1
             if app.novel_status == "HALTED":
                 raise Exception(f"HALTED: {app.novel_status}")
 
-            if count % 25 == 0 and progress_queue: 
+            # [FIX] Smart Throttling for Telegram Updates
+            # Only update every 200 chapters OR every 5 seconds
+            current_time = time.time()
+            if (count % 200 == 0) or (current_time - last_update_time > 5):
                 progress_queue.put(f"🚀 {int(app.progress)}% ({i}/{total})")
+                last_update_time = current_time
         
         if app.novel_status != "COMPLETED":
             raise Exception(f"Download completed with FAILED status.")
@@ -350,7 +358,7 @@ class NovelBot:
             await self.send_log(bot, f"⚠️ Backup Failed: {e}")
 
     def start(self):
-        print("🚀 Bot Starting ✨...")
+        print("🚀 Bot Starting...")
         sys.stdout.flush()
         if not TOKEN:
             print("❌ FATAL ERROR: TELEGRAM_TOKEN missing!")
@@ -473,11 +481,13 @@ class NovelBot:
             try:
                 try:
                     text = progress_queue.get_nowait()
-                    if text != last_text and (time.time() - last_update) > 5:
-                        try: 
-                            await self.send_log(bot, text, edit_msg=status_msg)
-                            last_text = text; last_update = time.time()
-                        except: pass
+                    if text != last_text:
+                        # Throttling logging updates to Telegram to prevent 429
+                        if (time.time() - last_update) > 5:
+                            try: 
+                                await self.send_log(bot, text, edit_msg=status_msg)
+                                last_text = text; last_update = time.time()
+                            except: pass
                 except queue.Empty: pass
                 await asyncio.sleep(0.5)
             except: await asyncio.sleep(0.5)
