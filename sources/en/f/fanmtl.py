@@ -2,7 +2,7 @@
 import logging
 import time
 import shutil
-import random
+import os
 from urllib.parse import urlparse, parse_qs 
 from bs4 import BeautifulSoup
 from lncrawl.models import Chapter
@@ -10,6 +10,7 @@ from lncrawl.core.crawler import Crawler
 
 # [CRITICAL] Bypass Tools
 from DrissionPage import ChromiumPage, ChromiumOptions
+from pyvirtualdisplay import Display
 from curl_cffi import requests as cffi_requests
 
 logger = logging.getLogger(__name__)
@@ -22,125 +23,139 @@ class FanMTLCrawler(Crawler):
         # [TURBO] 50 Threads
         self.init_executor(50) 
         
-        # 1. Setup the RUNNER (TLS Impersonation)
-        # Use chrome120 to match the browser
+        # 1. Setup the RUNNER (Placeholder, will be updated by Browser)
         self.runner = cffi_requests.Session(impersonate="chrome120")
         
-        # [CRITICAL] Use LINUX User-Agent to match Docker Container
-        # Sending "Windows" UA from a Linux Docker container = Instant Block
-        self.user_agent = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        
-        self.runner.headers.update({
-            "User-Agent": self.user_agent,
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Referer": "https://www.fanmtl.com/",
-        })
-        
-        # WARP Proxy (Optional - If this fails, comment these lines out to use VPS IP)
+        # WARP Proxy (Optional - Comment out if VPS IP is better)
         self.proxy_ip = "127.0.0.1"
         self.proxy_port = "40000"
-        self.runner.proxies = {
+        self.proxies = {
             "http": f"socks5h://{self.proxy_ip}:{self.proxy_port}",
             "https": f"socks5h://{self.proxy_ip}:{self.proxy_port}"
         }
+        # self.runner.proxies = self.proxies # Enable if using WARP
 
         self.scraper = self.runner
         self.cookies_synced = False
         self.cleaner.bad_css.update({'div[align="center"]'})
-        logger.info("FanMTL Strategy: DrissionPage (Linux UA) -> CFFI")
+        logger.info("FanMTL Strategy: DrissionPage Shadow-Clicker -> CFFI")
 
-    def get_cookies_via_drission(self, url):
-        """Uses DrissionPage (CDP) to solve Cloudflare."""
-        logger.info(f"🛡️ DrissionPage Solving: {url}")
+    def solve_captcha(self, url):
+        """Launches DrissionPage to solve Cloudflare Turnstile via Shadow DOM."""
+        logger.info(f"🛡️ Launching Solver: {url}")
+        display = None
         page = None
         
         try:
-            # Configure DrissionPage for Docker
+            # 1. Start Virtual Display (Bypass 'Headless' Check)
+            display = Display(visible=0, size=(1920, 1080))
+            display.start()
+
+            # 2. Configure Chromium
             co = ChromiumOptions()
             co.set_argument("--no-sandbox")
             co.set_argument("--disable-dev-shm-usage")
             co.set_argument("--disable-gpu")
-            co.set_argument("--disable-popup-blocking")
-            # [CRITICAL] Match the Runner UA
-            co.set_argument(f"--user-agent={self.user_agent}")
-            # [CRITICAL] Use WARP Proxy in Browser too
-            co.set_argument(f"--proxy-server=socks5://{self.proxy_ip}:{self.proxy_port}")
             
-            # Auto-find chromium
+            # [CRITICAL] Let the browser choose its own natural User-Agent
+            # We will copy it later. Do NOT force a mismatch.
+            
+            # Use Proxy if enabled
+            # co.set_argument(f"--proxy-server=socks5://{self.proxy_ip}:{self.proxy_port}")
+
             browser_path = shutil.which("chromium") or "/usr/bin/chromium"
             co.set_browser_path(browser_path)
 
             page = ChromiumPage(addr_or_opts=co)
             
-            # Load Page
+            # 3. Load Page
             page.get(url)
             
-            logger.info("⏳ Waiting for Turnstile/Challenge...")
+            logger.info("⏳ Analyzing Page...")
             start_time = time.time()
             
-            # Wait Loop
-            while time.time() - start_time < 60:
-                # Check for Success (Title is usually the Novel Title or 'FanMTL')
+            # 4. Solve Loop
+            while time.time() - start_time < 90:
                 title = page.title.lower()
+                
+                # Success Check
                 if "just a moment" not in title and "challenge" not in page.html.lower():
                     if "fanmtl" in title or "novel" in title:
+                        logger.info("🔓 Page Loaded Successfully!")
                         break
                 
-                # Check for 520 Error
+                # 520 Error Check
                 if "520" in title:
                     logger.warning("⚠️ 520 Error. Refreshing...")
                     page.refresh()
                     time.sleep(5)
                     continue
 
-                # DrissionPage auto-handles many turnstiles, but we wait
+                # [CRITICAL] TURNSTILE CLICKER (Shadow DOM)
+                # DrissionPage can find shadow roots easily.
+                try:
+                    # Look for the turnstile iframe
+                    ele = page.ele('@src^https://challenges.cloudflare.com')
+                    if ele:
+                        logger.info("👉 Found Turnstile. Attempting click...")
+                        # Click the body inside the iframe
+                        ele.click()
+                        time.sleep(2)
+                except: 
+                    pass
+                
                 time.sleep(1)
 
-            # Extract Cookies
+            # 5. Extract Session Data
             cookies = page.cookies(as_dict=True)
+            ua = page.run_js("return navigator.userAgent")
             
-            # Sync to Runner
-            self.runner.cookies.clear()
+            # 6. Verify Clearance
             found_cf = False
+            self.runner.cookies.clear()
+            
             for name, value in cookies.items():
                 if name == 'cf_clearance':
                     found_cf = True
                 self.runner.cookies.set(name, value, domain=".fanmtl.com")
             
             if found_cf:
-                logger.info("✅ COOKIE OBTAINED: cf_clearance found!")
+                logger.info("✅ CF-Clearance Obtained!")
+                # [CRITICAL] Update Runner to MATCH Browser
+                self.runner.headers['User-Agent'] = ua
                 self.cookies_synced = True
                 return page.html
             else:
-                logger.error("❌ Failed to get cf_clearance cookie.")
-                logger.error(f"Page Title: {page.title}")
+                logger.error("❌ Solver Failed: No cf_clearance cookie.")
+                # Debug Dump
+                with open("debug_failed_solve.html", "w", encoding="utf-8") as f:
+                    f.write(page.html)
                 return None
 
         except Exception as e:
-            logger.error(f"Drission Error: {e}")
+            logger.error(f"Solver Crash: {e}")
             return None
         finally:
-            if page: 
-                try: page.quit()
-                except: pass
+            if page: page.quit()
+            if display: display.stop()
 
     def get_soup_safe(self, url, headers=None):
         retries = 0
         while retries < 3:
             try:
-                # Solve if needed
+                # Solve if not synced
                 if not self.cookies_synced:
-                    self.get_cookies_via_drission(url)
+                    self.solve_captcha(url)
                     if not self.cookies_synced:
-                        raise Exception("Cookie sync failed")
+                        raise Exception("Solver failed")
 
+                # Fast Request
                 response = self.runner.get(url, timeout=20)
                 
-                # Check for Block
+                # Block Detection
                 if "just a moment" in response.text.lower() or response.status_code in [403, 520, 503]:
-                    logger.warning(f"⛔ Blocked ({response.status_code}). Re-solving...")
-                    self.cookies_synced = False # Force re-solve next loop
+                    logger.warning(f"⛔ Token Expired ({response.status_code}). Re-solving...")
+                    self.cookies_synced = False
                     time.sleep(2)
                     retries += 1
                     continue
@@ -158,12 +173,11 @@ class FanMTLCrawler(Crawler):
         logger.debug("Visiting %s", self.novel_url)
         
         # Initial Solve
-        html = self.get_cookies_via_drission(self.novel_url)
-        if not html:
-            # Fallback if browser failed to return source but got cookies
-            soup = self.get_soup_safe(self.novel_url)
-        else:
+        html = self.solve_captcha(self.novel_url)
+        if html:
             soup = self.make_soup(html)
+        else:
+            soup = self.get_soup_safe(self.novel_url)
 
         possible_title = soup.select_one("h1.novel-title")
         if possible_title:
@@ -181,7 +195,6 @@ class FanMTLCrawler(Crawler):
 
         self.parse_chapter_list(soup)
 
-        # Pagination
         pagination_links = soup.select('.pagination a[data-ajax-update="#chpagedlist"]')
         if pagination_links:
             try:
