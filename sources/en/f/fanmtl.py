@@ -21,13 +21,13 @@ class FanMTLCrawler(Crawler):
     base_url = "https://www.fanmtl.com/"
 
     def initialize(self):
-        # [TURBO] 60 Threads as requested
-        self.init_executor(20) 
+        # [TURBO] 60 Threads
+        self.init_executor(60) 
         
         # 1. Setup the RUNNER
         self.runner = cffi_requests.Session(impersonate="chrome120")
         
-        # [CRITICAL] Use Linux UA to match Docker
+        # Use Linux UA to match Docker
         self.user_agent = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         
         self.runner.headers.update({
@@ -36,19 +36,22 @@ class FanMTLCrawler(Crawler):
             "Referer": "https://www.fanmtl.com/",
         })
         
-        # WARP Proxy (Optional - Comment out if you want to use VPS IP)
+        # WARP Proxy Configuration
         self.proxy_ip = "127.0.0.1"
         self.proxy_port = "40000"
-        self.proxies = {
-            "http": f"socks5h://{self.proxy_ip}:{self.proxy_port}",
-            "https": f"socks5h://{self.proxy_ip}:{self.proxy_port}"
+        self.chrome_proxy = f"socks5://{self.proxy_ip}:{self.proxy_port}"
+        self.requests_proxy = f"socks5h://{self.proxy_ip}:{self.proxy_port}"
+
+        # [FIX] Enable Proxy for Downloader
+        self.runner.proxies = {
+            "http": self.requests_proxy,
+            "https": self.requests_proxy
         }
-        # self.runner.proxies = self.proxies 
 
         self.scraper = self.runner
         self.cookies_synced = False
         self.cleaner.bad_css.update({'div[align="center"]'})
-        logger.info("FanMTL Strategy: DrissionPage (Wait for Chapters) -> CFFI (60 Threads)")
+        logger.info("FanMTL Strategy: DrissionPage (WARP) -> CFFI (60 Threads)")
 
     def solve_captcha(self, url):
         """Launches DrissionPage to solve Cloudflare Turnstile."""
@@ -69,6 +72,9 @@ class FanMTLCrawler(Crawler):
             co.set_argument("--disable-popup-blocking")
             co.set_argument(f"--user-agent={self.user_agent}")
             
+            # [FIX] Enable Proxy for Browser (Fixes Loop on dirty VPS IP)
+            co.set_argument(f"--proxy-server={self.chrome_proxy}")
+            
             browser_path = shutil.which("chromium") or "/usr/bin/chromium"
             co.set_browser_path(browser_path)
 
@@ -81,32 +87,23 @@ class FanMTLCrawler(Crawler):
             start_time = time.time()
             
             # 4. Solve Loop
-            while time.time() - start_time < 90:
+            while time.time() - start_time < 60:
                 title = page.title.lower()
                 
-                # [CRITICAL] Check for 520 Error
+                # [FIX] 520 Error Handling
                 if "520" in title:
                     logger.warning("⚠️ 520 Error. Refreshing...")
                     page.refresh()
                     time.sleep(5)
                     continue
 
-                # [CRITICAL] Check for Chapters
-                # We do NOT return until we see the list or confirm it's empty
+                # [FIX] Success Condition (Relaxed)
+                # If "Just a moment" is gone and we see the Site Title, we are in.
+                # We do NOT wait for chapters, to support empty novels.
                 if "just a moment" not in title and "challenge" not in page.html.lower():
-                    # Look for chapter list container
-                    if page.ele(".chapter-list") or page.ele("ul.chapters") or page.ele("a[href*='/chapter-']"):
-                        logger.info("🔓 Page Loaded & Chapters Visible!")
-                        break
-                    
-                    # If we are on the page but no chapters found yet, wait a bit more for JS
                     if "fanmtl" in title or "novel" in title:
-                        logger.info("🔓 Novel Page Loaded (Waiting for chapter list)...")
-                        time.sleep(2)
-                        # If still nothing after wait, maybe it's empty?
-                        # We break to let the parser check
-                        if time.time() - start_time > 20: 
-                            break
+                        logger.info("🔓 Cloudflare Bypassed!")
+                        break
 
                 # Turnstile Clicker
                 try:
@@ -118,8 +115,7 @@ class FanMTLCrawler(Crawler):
                 
                 time.sleep(1)
 
-            # 5. Extract Session Data [FIXED CRASH]
-            # Manual conversion for DrissionPage cookies list
+            # 5. Extract Session Data
             cookies_list = page.cookies() 
             ua = page.run_js("return navigator.userAgent")
             
@@ -131,18 +127,22 @@ class FanMTLCrawler(Crawler):
                 name = cookie.get('name')
                 value = cookie.get('value')
                 
-                # Only keep clearance to prevent 520 header bloat
-                if name in ['cf_clearance', '__cf_bm']:
+                if name == 'cf_clearance':
                     found_cf = True
-                    self.runner.cookies.set(name, value, domain=".fanmtl.com")
+                
+                self.runner.cookies.set(name, value, domain=".fanmtl.com")
             
-            if found_cf:
-                logger.info("✅ CF-Clearance Obtained!")
+            # [FIX] Allow proceeding even if cf_clearance is missing IF we have other cookies
+            # Sometimes 520 errors make the clearance cookie invisible or short-lived
+            if found_cf or len(cookies_list) > 0:
+                if found_cf: logger.info("✅ CF-Clearance Obtained!")
+                else: logger.warning("⚠️ No Clearance cookie, but session cookies found. Attempting...")
+                
                 self.runner.headers['User-Agent'] = ua
                 self.cookies_synced = True
                 return page.html
             else:
-                logger.error("❌ Solver Failed: No cf_clearance cookie.")
+                logger.error("❌ Solver Failed: No cookies found.")
                 return None
 
         except Exception as e:
@@ -182,7 +182,7 @@ class FanMTLCrawler(Crawler):
     def read_novel_info(self):
         logger.debug("Visiting %s", self.novel_url)
         
-        # [FIX] Get HTML from browser (which waited for chapters)
+        # Get HTML from browser
         html = self.solve_captcha(self.novel_url)
         if html:
             soup = self.make_soup(html)
@@ -203,7 +203,6 @@ class FanMTLCrawler(Crawler):
         self.volumes = [{"id": 1, "title": "Volume 1"}]
         self.chapters = []
 
-        # Parse from the browser source (Guaranteed to have chapters now)
         self.parse_chapter_list(soup)
 
         pagination_links = soup.select('.pagination a[data-ajax-update="#chpagedlist"]')
@@ -229,11 +228,10 @@ class FanMTLCrawler(Crawler):
         self.chapters.sort(key=lambda x: x["id"])
 
         if not self.chapters:
-            logger.error("❌ NO CHAPTERS FOUND.")
+            logger.error(f"❌ NO CHAPTERS FOUND. (Title: {self.novel_title})")
 
     def parse_chapter_list(self, soup):
         if not soup: return
-        # Aggressive selector
         links = soup.select(".chapter-list a, ul.chapter-list li a")
         if not links:
             links = soup.select("a[href*='/chapter-']")
