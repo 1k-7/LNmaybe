@@ -38,7 +38,7 @@ class FanMTLCrawler(Crawler):
         self.scraper = self.runner
         self.cookies_synced = False
         self.cleaner.bad_css.update({'div[align="center"]'})
-        logger.info("FanMTL Strategy: DrissionPage (Fix) -> CFFI")
+        logger.info("FanMTL Strategy: DrissionPage (Strict Wait) -> CFFI")
 
     def solve_captcha(self, url):
         """Launches DrissionPage to solve Cloudflare Turnstile."""
@@ -73,10 +73,11 @@ class FanMTLCrawler(Crawler):
             while time.time() - start_time < 90:
                 title = page.title.lower()
                 
-                # Success Check
+                # [CRITICAL FIX] Strict Content Wait
+                # Do not proceed unless we see the CHAPTER LIST
                 if "just a moment" not in title and "challenge" not in page.html.lower():
-                    if "fanmtl" in title or "novel" in title:
-                        logger.info("🔓 Page Loaded Successfully!")
+                    if page.ele(".chapter-list") or page.ele("ul.chapters") or page.ele(".chapters"):
+                        logger.info("🔓 Page Loaded & Chapters Visible!")
                         break
                 
                 # 520 Error Check
@@ -96,8 +97,8 @@ class FanMTLCrawler(Crawler):
                 
                 time.sleep(1)
 
-            # 5. Extract Session Data [FIXED CRASH]
-            # DrissionPage v4 cookies() returns a list of dicts, does not accept as_dict=True
+            # 5. Extract Session Data
+            # Note: DrissionPage cookies() returns a LIST of dicts
             cookies_list = page.cookies() 
             ua = page.run_js("return navigator.userAgent")
             
@@ -121,7 +122,9 @@ class FanMTLCrawler(Crawler):
                 self.cookies_synced = True
                 return page.html
             else:
-                logger.error("❌ Solver Failed: No cf_clearance cookie found in list.")
+                logger.error("❌ Solver Failed: No cf_clearance cookie.")
+                # Debug Dump - Use this to see what the bot saw
+                logger.error(f"Last Title: {page.title}")
                 return None
 
         except Exception as e:
@@ -161,6 +164,7 @@ class FanMTLCrawler(Crawler):
     def read_novel_info(self):
         logger.debug("Visiting %s", self.novel_url)
         
+        # [FIX] Get HTML from browser (which waited for chapters)
         html = self.solve_captcha(self.novel_url)
         if html:
             soup = self.make_soup(html)
@@ -181,6 +185,7 @@ class FanMTLCrawler(Crawler):
         self.volumes = [{"id": 1, "title": "Volume 1"}]
         self.chapters = []
 
+        # Parse from the browser source (Guaranteed to have chapters now)
         self.parse_chapter_list(soup)
 
         pagination_links = soup.select('.pagination a[data-ajax-update="#chpagedlist"]')
@@ -206,10 +211,12 @@ class FanMTLCrawler(Crawler):
         self.chapters.sort(key=lambda x: x["id"])
 
         if not self.chapters:
-            logger.error("❌ NO CHAPTERS FOUND.")
+            logger.error("❌ NO CHAPTERS FOUND. Dumping Page Title to verify:")
+            if soup.title: logger.error(soup.title.string)
 
     def parse_chapter_list(self, soup):
         if not soup: return
+        # Aggressive selector
         links = soup.select(".chapter-list a, ul.chapter-list li a")
         if not links:
             links = soup.select("a[href*='/chapter-']")
@@ -218,7 +225,8 @@ class FanMTLCrawler(Crawler):
             try:
                 url = self.absolute_url(a["href"])
                 if any(x['url'] == url for x in self.chapters): continue
-                title = a.text.strip()
+                title_tag = a.select_one(".chapter-title")
+                title = title_tag.text.strip() if title_tag else a.text.strip()
                 self.chapters.append(Chapter(id=len(self.chapters)+1, volume=1, url=url, title=title))
             except: pass
 
