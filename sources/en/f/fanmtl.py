@@ -2,7 +2,8 @@
 import logging
 import time
 import shutil
-import os
+import random
+from threading import Lock
 from urllib.parse import urlparse, parse_qs 
 from bs4 import BeautifulSoup
 from lncrawl.models import Chapter
@@ -20,25 +21,34 @@ class FanMTLCrawler(Crawler):
     base_url = "https://www.fanmtl.com/"
 
     def initialize(self):
-        # [TURBO] 50 Threads
-        self.init_executor(50) 
+        # [TURBO] 60 Threads as requested
+        self.init_executor(20) 
         
         # 1. Setup the RUNNER
         self.runner = cffi_requests.Session(impersonate="chrome120")
         
-        # WARP Proxy (Optional - Comment out if VPS IP is better)
+        # [CRITICAL] Use Linux UA to match Docker
+        self.user_agent = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        
+        self.runner.headers.update({
+            "User-Agent": self.user_agent,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            "Referer": "https://www.fanmtl.com/",
+        })
+        
+        # WARP Proxy (Optional - Comment out if you want to use VPS IP)
         self.proxy_ip = "127.0.0.1"
         self.proxy_port = "40000"
         self.proxies = {
             "http": f"socks5h://{self.proxy_ip}:{self.proxy_port}",
             "https": f"socks5h://{self.proxy_ip}:{self.proxy_port}"
         }
-        # self.runner.proxies = self.proxies # Enable if using WARP
+        # self.runner.proxies = self.proxies 
 
         self.scraper = self.runner
         self.cookies_synced = False
         self.cleaner.bad_css.update({'div[align="center"]'})
-        logger.info("FanMTL Strategy: DrissionPage (Strict Wait) -> CFFI")
+        logger.info("FanMTL Strategy: DrissionPage (Wait for Chapters) -> CFFI (60 Threads)")
 
     def solve_captcha(self, url):
         """Launches DrissionPage to solve Cloudflare Turnstile."""
@@ -57,6 +67,7 @@ class FanMTLCrawler(Crawler):
             co.set_argument("--disable-dev-shm-usage")
             co.set_argument("--disable-gpu")
             co.set_argument("--disable-popup-blocking")
+            co.set_argument(f"--user-agent={self.user_agent}")
             
             browser_path = shutil.which("chromium") or "/usr/bin/chromium"
             co.set_browser_path(browser_path)
@@ -73,19 +84,29 @@ class FanMTLCrawler(Crawler):
             while time.time() - start_time < 90:
                 title = page.title.lower()
                 
-                # [CRITICAL FIX] Strict Content Wait
-                # Do not proceed unless we see the CHAPTER LIST
-                if "just a moment" not in title and "challenge" not in page.html.lower():
-                    if page.ele(".chapter-list") or page.ele("ul.chapters") or page.ele(".chapters"):
-                        logger.info("🔓 Page Loaded & Chapters Visible!")
-                        break
-                
-                # 520 Error Check
+                # [CRITICAL] Check for 520 Error
                 if "520" in title:
                     logger.warning("⚠️ 520 Error. Refreshing...")
                     page.refresh()
                     time.sleep(5)
                     continue
+
+                # [CRITICAL] Check for Chapters
+                # We do NOT return until we see the list or confirm it's empty
+                if "just a moment" not in title and "challenge" not in page.html.lower():
+                    # Look for chapter list container
+                    if page.ele(".chapter-list") or page.ele("ul.chapters") or page.ele("a[href*='/chapter-']"):
+                        logger.info("🔓 Page Loaded & Chapters Visible!")
+                        break
+                    
+                    # If we are on the page but no chapters found yet, wait a bit more for JS
+                    if "fanmtl" in title or "novel" in title:
+                        logger.info("🔓 Novel Page Loaded (Waiting for chapter list)...")
+                        time.sleep(2)
+                        # If still nothing after wait, maybe it's empty?
+                        # We break to let the parser check
+                        if time.time() - start_time > 20: 
+                            break
 
                 # Turnstile Clicker
                 try:
@@ -97,8 +118,8 @@ class FanMTLCrawler(Crawler):
                 
                 time.sleep(1)
 
-            # 5. Extract Session Data
-            # Note: DrissionPage cookies() returns a LIST of dicts
+            # 5. Extract Session Data [FIXED CRASH]
+            # Manual conversion for DrissionPage cookies list
             cookies_list = page.cookies() 
             ua = page.run_js("return navigator.userAgent")
             
@@ -110,11 +131,10 @@ class FanMTLCrawler(Crawler):
                 name = cookie.get('name')
                 value = cookie.get('value')
                 
-                if name == 'cf_clearance':
+                # Only keep clearance to prevent 520 header bloat
+                if name in ['cf_clearance', '__cf_bm']:
                     found_cf = True
-                
-                # Set cookie in runner
-                self.runner.cookies.set(name, value, domain=".fanmtl.com")
+                    self.runner.cookies.set(name, value, domain=".fanmtl.com")
             
             if found_cf:
                 logger.info("✅ CF-Clearance Obtained!")
@@ -123,8 +143,6 @@ class FanMTLCrawler(Crawler):
                 return page.html
             else:
                 logger.error("❌ Solver Failed: No cf_clearance cookie.")
-                # Debug Dump - Use this to see what the bot saw
-                logger.error(f"Last Title: {page.title}")
                 return None
 
         except Exception as e:
@@ -211,8 +229,7 @@ class FanMTLCrawler(Crawler):
         self.chapters.sort(key=lambda x: x["id"])
 
         if not self.chapters:
-            logger.error("❌ NO CHAPTERS FOUND. Dumping Page Title to verify:")
-            if soup.title: logger.error(soup.title.string)
+            logger.error("❌ NO CHAPTERS FOUND.")
 
     def parse_chapter_list(self, soup):
         if not soup: return
