@@ -3,7 +3,7 @@ import logging
 import requests
 import time
 import os
-import json
+from threading import Lock
 from urllib.parse import urlparse, parse_qs 
 from bs4 import BeautifulSoup
 from lncrawl.models import Chapter
@@ -16,81 +16,104 @@ class FanMTLCrawler(Crawler):
     base_url = "https://www.fanmtl.com/"
 
     def initialize(self):
-        # Read Config from Docker Env
+        # Read Config
         self.proxy_url = os.getenv("RENDER_PROXY_URL")
         self.deploy_hook = os.getenv("RENDER_DEPLOY_HOOK")
 
         if not self.proxy_url:
-            raise Exception("❌ RENDER_PROXY_URL is missing! Pass it in docker run -e.")
+            raise Exception("❌ RENDER_PROXY_URL missing! Check docker run -e params.")
 
-        # Strip trailing slash if present
         self.proxy_url = self.proxy_url.rstrip("/")
         
-        # [TURBO] 60 Threads (Safe via Proxy)
+        # [TURBO] 60 Threads
         self.init_executor(60) 
+        
+        # [CRITICAL FIX] Connection Pool Size
+        # Must exceed thread count (60) to prevent "Connection pool is full" warnings
         self.bridge = requests.Session()
+        adapter = requests.adapters.HTTPAdapter(pool_connections=100, pool_maxsize=100)
+        self.bridge.mount("https://", adapter)
+        self.bridge.mount("http://", adapter)
+        
+        # [CRITICAL FIX] Thread Lock for Redeploy
+        # Prevents 60 threads from triggering the hook at the same time
+        self.redeploy_lock = Lock()
+
         self.cleaner.bad_css.update({'div[align="center"]'})
         
-        # Health Check
+        # Initial Health Check
         self.check_proxy_health()
-        logger.info(f"FanMTL Strategy: Remote Proxy ({self.proxy_url})")
+        logger.info(f"FanMTL Strategy: Render Proxy ({self.proxy_url}) + 60 Threads")
 
     def check_proxy_health(self):
-        """Verifies the Render Proxy is running the correct code."""
+        """Verifies the Render Proxy is running."""
         try:
-            logger.info(f"Testing Proxy: {self.proxy_url}/")
             resp = self.bridge.get(f"{self.proxy_url}/", timeout=10)
             if resp.status_code != 200 or resp.json().get("status") != "alive":
-                raise Exception(f"Proxy returned {resp.status_code} (Expected 200 'alive')")
-            logger.info("✅ Proxy Connection Established!")
+                raise Exception("Proxy not alive")
         except Exception as e:
-            logger.critical(f"❌ PROXY FAILED: {e}")
-            logger.critical("Did you deploy the 'main.py' FastAPI code to Render? If you deployed the bot code there, it won't work.")
-            raise Exception("Proxy Unreachable")
+            logger.warning(f"⚠️ Proxy Health Check Failed: {e}")
+            # Don't crash, maybe it's just waking up
 
     def trigger_redeploy(self):
-        """Triggers a New IP deployment on Render."""
+        """Thread-safe IP Rotation."""
         if not self.deploy_hook:
-            logger.error("⚠️ No RENDER_DEPLOY_HOOK provided. Cannot rotate IP!")
+            logger.error("⚠️ No Deploy Hook! Cannot rotate IP.")
             return False
 
-        logger.critical("♻️ IP BLOCKED! Triggering Render Redeploy...")
-        try:
-            self.bridge.get(self.deploy_hook)
-            logger.info("⏳ Redeploy triggered. Waiting for service restart (approx 2-3 mins)...")
-            
-            time.sleep(30)
-            # Poll for health
-            for i in range(60): # Wait up to 10 mins
-                try:
-                    r = self.bridge.get(f"{self.proxy_url}/", timeout=5)
-                    if r.status_code == 200:
-                        logger.info("✅ New IP Online! Resuming...")
-                        return True
-                except: pass
-                logger.info("💤 Waiting for Render...")
-                time.sleep(10)
+        # Acquire Lock: Only 1 thread can run this block at a time.
+        # Others will wait here until it finishes.
+        with self.redeploy_lock:
+            # 1. Double Check: Maybe another thread already fixed it?
+            try:
+                if self.bridge.get(f"{self.proxy_url}/", timeout=5).status_code == 200:
+                    # logger.info("Using fresh IP from previous redeploy.")
+                    return True
+            except: pass
+
+            logger.critical("♻️ TRIGGERING RENDER REDEPLOY (Rotating IP)...")
+            try:
+                # 2. Trigger Hook
+                self.bridge.get(self.deploy_hook)
+                logger.info("⏳ Waiting for Service Restart (approx 3 mins)...")
                 
-            logger.error("❌ Redeploy timed out.")
-            return False
-        except Exception as e:
-            logger.error(f"Redeploy Error: {e}")
-            return False
+                # 3. Wait for downtime (service stops)
+                time.sleep(30)
+                
+                # 4. Poll until back online
+                for i in range(60): # 10 minutes max
+                    try:
+                        r = self.bridge.get(f"{self.proxy_url}/", timeout=5)
+                        if r.status_code == 200:
+                            logger.info("✅ Render Service Back Online! Resuming...")
+                            return True
+                    except: pass
+                    
+                    if i % 6 == 0: logger.info("💤 Waiting for Render...")
+                    time.sleep(10)
+                    
+                logger.error("❌ Redeploy timed out.")
+                return False
+            except Exception as e:
+                logger.error(f"Redeploy Error: {e}")
+                return False
 
     def fetch_via_render(self, url):
         """Fetches URL via Proxy."""
         for _ in range(3):
             try:
-                resp = self.bridge.post(f"{self.proxy_url}/fetch", json={"url": url}, timeout=45)
+                resp = self.bridge.post(f"{self.proxy_url}/fetch", json={"url": url}, timeout=60)
                 
-                if resp.status_code != 200:
-                    logger.warning(f"Proxy Gateway Error ({resp.status_code})")
+                # Handle Gateway Errors (Render Restarting)
+                if resp.status_code in [502, 503, 504, 404]:
                     time.sleep(5)
                     continue
 
                 data = resp.json()
                 
+                # Handle Blocks
                 if data.get("status") == "blocked":
+                    # This call will block this thread until new IP is ready
                     if self.trigger_redeploy():
                         continue 
                     else:
@@ -100,7 +123,6 @@ class FanMTLCrawler(Crawler):
                     return data.get("html")
 
             except Exception as e:
-                logger.warning(f"Bridge Error: {e}")
                 time.sleep(2)
         return None
 
